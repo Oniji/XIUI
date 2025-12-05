@@ -28,6 +28,7 @@ local categories = {
     { name = 'expBar', label = 'Exp Bar' },
     { name = 'gilTracker', label = 'Gil Tracker' },
     { name = 'inventoryTracker', label = 'Inventory' },
+    { name = 'satchelTracker', label = 'Satchel' },
     { name = 'castBar', label = 'Cast Bar' },
 };
 
@@ -1056,6 +1057,125 @@ local function DrawInventoryTrackerColorSettings()
     imgui.ShowHelp('Inventory count at which dots turn to critical color');
 end
 
+-- Section: Satchel Tracker Settings
+local function DrawSatchelTrackerSettings()
+    DrawCheckbox('Enabled', 'showSatchelTracker', CheckVisibility);
+    DrawCheckbox('Show Count', 'satchelShowCount');
+
+    local columnCount = { gConfig.satchelTrackerColumnCount };
+    if (imgui.SliderInt('Columns', columnCount, 1, 80)) then
+        gConfig.satchelTrackerColumnCount = columnCount[1];
+        UpdateUserSettings();
+    end
+    if (imgui.IsItemDeactivatedAfterEdit()) then
+        SaveSettingsOnly();
+    end
+
+    local rowCount = { gConfig.satchelTrackerRowCount };
+    if (imgui.SliderInt('Rows', rowCount, 1, 80)) then
+        gConfig.satchelTrackerRowCount = rowCount[1];
+        UpdateUserSettings();
+    end
+    if (imgui.IsItemDeactivatedAfterEdit()) then
+        SaveSettingsOnly();
+    end
+
+    DrawSlider('Scale', 'satchelTrackerScale', 0.5, 3.0, '%.1f');
+    DrawSlider('Font Size', 'satchelTrackerFontSize', 8, 36);
+end
+
+-- Section: Satchel Tracker Color Settings
+local function DrawSatchelTrackerColorSettings()
+    imgui.Text("Text Color:");
+    imgui.Separator();
+    imgui.Spacing();
+    DrawTextColorPicker("Count Text", gConfig.colorCustomization.satchelTracker, 'textColor', "Color of satchel count text");
+
+    imgui.Spacing();
+    imgui.Text("Dot Colors:");
+    imgui.Separator();
+    imgui.Spacing();
+
+    local emptySlot = {
+        gConfig.colorCustomization.satchelTracker.emptySlotColor.r,
+        gConfig.colorCustomization.satchelTracker.emptySlotColor.g,
+        gConfig.colorCustomization.satchelTracker.emptySlotColor.b,
+        gConfig.colorCustomization.satchelTracker.emptySlotColor.a
+    };
+    if (imgui.ColorEdit4('Empty Slot', emptySlot, bit.bor(ImGuiColorEditFlags_AlphaBar, ImGuiColorEditFlags_NoInputs))) then
+        gConfig.colorCustomization.satchelTracker.emptySlotColor.r = emptySlot[1];
+        gConfig.colorCustomization.satchelTracker.emptySlotColor.g = emptySlot[2];
+        gConfig.colorCustomization.satchelTracker.emptySlotColor.b = emptySlot[3];
+        gConfig.colorCustomization.satchelTracker.emptySlotColor.a = emptySlot[4];
+    end
+    if (imgui.IsItemDeactivatedAfterEdit()) then SaveSettingsOnly(); end
+    imgui.ShowHelp('Color for empty satchel slots');
+
+    local usedSlot = {
+        gConfig.colorCustomization.satchelTracker.usedSlotColor.r,
+        gConfig.colorCustomization.satchelTracker.usedSlotColor.g,
+        gConfig.colorCustomization.satchelTracker.usedSlotColor.b,
+        gConfig.colorCustomization.satchelTracker.usedSlotColor.a
+    };
+    if (imgui.ColorEdit4('Used Slot (Normal)', usedSlot, bit.bor(ImGuiColorEditFlags_AlphaBar, ImGuiColorEditFlags_NoInputs))) then
+        gConfig.colorCustomization.satchelTracker.usedSlotColor.r = usedSlot[1];
+        gConfig.colorCustomization.satchelTracker.usedSlotColor.g = usedSlot[2];
+        gConfig.colorCustomization.satchelTracker.usedSlotColor.b = usedSlot[3];
+        gConfig.colorCustomization.satchelTracker.usedSlotColor.a = usedSlot[4];
+    end
+    if (imgui.IsItemDeactivatedAfterEdit()) then SaveSettingsOnly(); end
+    imgui.ShowHelp('Color for used satchel slots (normal)');
+
+    local usedSlotThreshold1 = {
+        gConfig.colorCustomization.satchelTracker.usedSlotColorThreshold1.r,
+        gConfig.colorCustomization.satchelTracker.usedSlotColorThreshold1.g,
+        gConfig.colorCustomization.satchelTracker.usedSlotColorThreshold1.b,
+        gConfig.colorCustomization.satchelTracker.usedSlotColorThreshold1.a
+    };
+    if (imgui.ColorEdit4('Used Slot (Warning)', usedSlotThreshold1, bit.bor(ImGuiColorEditFlags_AlphaBar, ImGuiColorEditFlags_NoInputs))) then
+        gConfig.colorCustomization.satchelTracker.usedSlotColorThreshold1.r = usedSlotThreshold1[1];
+        gConfig.colorCustomization.satchelTracker.usedSlotColorThreshold1.g = usedSlotThreshold1[2];
+        gConfig.colorCustomization.satchelTracker.usedSlotColorThreshold1.b = usedSlotThreshold1[3];
+        gConfig.colorCustomization.satchelTracker.usedSlotColorThreshold1.a = usedSlotThreshold1[4];
+    end
+    if (imgui.IsItemDeactivatedAfterEdit()) then SaveSettingsOnly(); end
+    imgui.ShowHelp('Color for used satchel slots when at warning threshold');
+
+    local usedSlotThreshold2 = {
+        gConfig.colorCustomization.satchelTracker.usedSlotColorThreshold2.r,
+        gConfig.colorCustomization.satchelTracker.usedSlotColorThreshold2.g,
+        gConfig.colorCustomization.satchelTracker.usedSlotColorThreshold2.b,
+        gConfig.colorCustomization.satchelTracker.usedSlotColorThreshold2.a
+    };
+    if (imgui.ColorEdit4('Used Slot (Critical)', usedSlotThreshold2, bit.bor(ImGuiColorEditFlags_AlphaBar, ImGuiColorEditFlags_NoInputs))) then
+        gConfig.colorCustomization.satchelTracker.usedSlotColorThreshold2.r = usedSlotThreshold2[1];
+        gConfig.colorCustomization.satchelTracker.usedSlotColorThreshold2.g = usedSlotThreshold2[2];
+        gConfig.colorCustomization.satchelTracker.usedSlotColorThreshold2.b = usedSlotThreshold2[3];
+        gConfig.colorCustomization.satchelTracker.usedSlotColorThreshold2.a = usedSlotThreshold2[4];
+    end
+    if (imgui.IsItemDeactivatedAfterEdit()) then SaveSettingsOnly(); end
+    imgui.ShowHelp('Color for used satchel slots when at critical threshold');
+
+    imgui.Spacing();
+    imgui.Text("Color Thresholds:");
+    imgui.Separator();
+    imgui.Spacing();
+
+    local threshold1 = { gConfig.satchelTrackerColorThreshold1 };
+    if (imgui.SliderInt('Warning Threshold', threshold1, 0, 80)) then
+        gConfig.satchelTrackerColorThreshold1 = threshold1[1];
+    end
+    if (imgui.IsItemDeactivatedAfterEdit()) then SaveSettingsOnly(); end
+    imgui.ShowHelp('Satchel count at which dots turn to warning color');
+
+    local threshold2 = { gConfig.satchelTrackerColorThreshold2 };
+    if (imgui.SliderInt('Critical Threshold', threshold2, 0, 80)) then
+        gConfig.satchelTrackerColorThreshold2 = threshold2[1];
+    end
+    if (imgui.IsItemDeactivatedAfterEdit()) then SaveSettingsOnly(); end
+    imgui.ShowHelp('Satchel count at which dots turn to critical color');
+end
+
 -- Helper for Cast Bar: Draw a single fast cast slider
 local function DrawFastCastSlider(jobName, jobIndex)
     local value = { gConfig.castBarFastCast[jobIndex] };
@@ -1131,6 +1251,7 @@ local settingsDrawFunctions = {
     DrawExpBarSettings,
     DrawGilTrackerSettings,
     DrawInventoryTrackerSettings,
+    DrawSatchelTrackerSettings,
     DrawCastBarSettings,
 };
 
@@ -1143,6 +1264,7 @@ local colorSettingsDrawFunctions = {
     DrawExpBarColorSettings,
     DrawGilTrackerColorSettings,
     DrawInventoryTrackerColorSettings,
+    DrawSatchelTrackerColorSettings,
     DrawCastBarColorSettings,
 };
 

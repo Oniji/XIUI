@@ -86,6 +86,7 @@ patchNotes.DrawWindow = function()
 		imgui.BulletText('HP gradient enabled by default');
 		imgui.BulletText('Color interpolation configuration');
 		imgui.BulletText('Castbar accuracy improvements for self and party members');
+		imgui.BulletText('Satchel Tracker');
 		imgui.NewLine();
 		imgui.TextColored({0.4, 0.8, 1.0, 1.0}, 'UI Improvements');
 		imgui.BulletText('Redesigned config menu with new layout');
