@@ -656,6 +656,9 @@ local function DrawPartyTabContent(party, partyName)
     DrawPartyCheckbox(party, 'Show Job Icons', 'showJobIcon');
     DrawPartyCheckbox(party, 'Show Job/Subjob', 'showJob');
     imgui.ShowHelp('Display job and subjob info (Horizontal layout only).');
+    DrawPartyCheckbox(party, 'Show Job Level Text', 'showJobLevel');
+    DrawPartyCheckbox(party, 'Show Main Job Text', 'showMainJob');
+    DrawPartyCheckbox(party, 'Show Sub Job Text', 'showSubJob');
     DrawPartyCheckbox(party, 'Show Cast Bars', 'showCastBars');
     if party.showCastBars then
         imgui.SameLine();

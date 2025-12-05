@@ -169,6 +169,9 @@ local function updatePartyConfigCache()
         cache.distanceHighlight = party.distanceHighlight or 0;
         cache.showJobIcon = party.showJobIcon;
         cache.showJob = party.showJob;
+        cache.showJobLevel = party.showJobLevel;
+        cache.showMainJob = party.showMainJob;
+        cache.showSubJob = party.showSubJob;
         cache.showCastBars = party.showCastBars;
         cache.castBarScaleY = party.castBarScaleY or 0.6;
         cache.showBookends = party.showBookends;
@@ -1075,12 +1078,19 @@ local function DrawMember(memIdx, settings, isLastVisibleMember)
     local showJobText = false;
     if cache.showJob and layout == 0 and memInfo.inzone and memInfo.job ~= '' and memInfo.job ~= nil and memInfo.job > 0 then
         -- Build job string (e.g., "WAR99/NIN49")
-        local mainJobAbbr = AshitaCore:GetResourceManager():GetString('jobs.names_abbr', memInfo.job) or '';
-        local jobStr = mainJobAbbr .. tostring(memInfo.level);
-
-        if memInfo.subjob ~= nil and memInfo.subjob ~= '' and memInfo.subjob > 0 then
+        local jobStr = '';
+        if cache.showMainJob then
+            jobStr = jobStr .. AshitaCore:GetResourceManager():GetString('jobs.names_abbr', memInfo.job) or '';
+            if cache.showJobLevel then
+                jobStr = jobStr .. tostring(memInfo.level);
+            end
+        end
+        if memInfo.subjob ~= nil and memInfo.subjob ~= '' and memInfo.subjob > 0 and cache.showSubJob then
             local subJobAbbr = AshitaCore:GetResourceManager():GetString('jobs.names_abbr', memInfo.subjob) or '';
-            jobStr = jobStr .. '/' .. subJobAbbr .. tostring(memInfo.subjoblevel);
+            jobStr = jobStr .. '/' .. subJobAbbr 
+            if cache.showJobLevel then
+                jobStr = jobStr .. tostring(memInfo.subjoblevel);
+            end
         end
 
         memberText[memIdx].job:set_text(jobStr);
