@@ -1,18 +1,18 @@
 --[[
 * MIT License
-* 
+*
 * Copyright (c) 2023 tirem [github.com/tirem]
-* 
+*
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to deal
 * in the Software without restriction, including without limitation the rights
 * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 * copies of the Software, and to permit persons to whom the Software is
 * furnished to do so, subject to the following conditions:
-* 
+*
 * The above copyright notice and this permission notice shall be included in all
 * copies or substantial portions of the Software.
-* 
+*
 * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
@@ -24,2257 +24,1614 @@
 
 addon.name      = 'XIUI';
 addon.author    = 'Team XIUI';
-addon.version   = '1.5.1';
+addon.version   = '1.7.3';
 addon.desc      = 'Multiple UI elements with manager';
 addon.link      = 'https://github.com/tirem/XIUI'
 
 -- Ashita version targeting (for ImGui compatibility)
--- Set to true when developing/testing against Ashita 4.3 (2025_q3_update branch)
--- Set to false for releases targeting current main branch (most players)
--- See: https://github.com/AshitaXI/Ashita-v4beta/tree/2025_q3_update
 _G._XIUI_USE_ASHITA_4_3 = false;
-require('imgui_compat'); -- Must be before any module that uses imgui
-
-require('common');
-local settings = require('settings');
-local playerBar = require('playerbar');
-local targetBar = require('targetbar');
-local enemyList = require('enemylist');
-local expBar = require('expbar');
-local gilTracker = require('giltracker');
-local inventoryTracker = require('inventorytracker');
-local satchelTracker = require('satcheltracker');
-local partyList = require('partylist');
-local castBar = require('castbar');
-local configMenu = require('configmenu');
-local debuffHandler = require('debuffhandler');
-local actionTracker = require('actiontracker');
-local patchNotes = require('patchNotes');
-local statusHandler = require('statushandler');
-local gdi = require('gdifonts.include');
-
--- Render flags constants
-local RENDER_FLAG_VISIBLE = 0x200;  -- Entity is visible and rendered
-local RENDER_FLAG_HIDDEN = 0x4000;  -- Entity is hidden (cutscene, menu, etc.)
+require('handlers.imgui_compat');
 
 -- =================
 -- = XIUI DEV ONLY =
 -- =================
--- Hot reloading of development files functionality
 local _XIUI_DEV_HOT_RELOADING_ENABLED = false;
 local _XIUI_DEV_HOT_RELOAD_POLL_TIME_SECONDS = 1;
 local _XIUI_DEV_HOT_RELOAD_LAST_RELOAD_TIME;
 local _XIUI_DEV_HOT_RELOAD_FILES = {};
--- Global switch to hard-disable functionaliy that is limited on HX servers
-HzLimitedMode = true;
 
-function string:split(sep)
-   local sep, fields = sep or ":", {}
-   local pattern = string.format("([^%s]+)", sep)
-   self:gsub(pattern, function(c) fields[#fields+1] = c end)
-   return fields
+-- Debug flag for raw controller input (enable with /xiui debug rawinput)
+-- This logs ALL xinput/dinput events from Ashita before any XIUI processing
+DEBUG_RAW_INPUT = false;
+
+require('common');
+local chat = require('chat');
+local settings = require('settings');
+local gdi = require('submodules.gdifonts.include');
+
+-- Core modules
+local settingsDefaults = require('core.settings.init');
+local settingsMigration = require('core.settings.migration');
+local settingsUpdater = require('core.settings.updater');
+local gameState = require('core.gamestate');
+local uiModules = require('core.moduleregistry');
+local profileManager = require('core.profile_manager');
+
+-- UI modules
+local uiMods = require('modules.init');
+local playerBar = uiMods.playerbar;
+local targetBar = uiMods.targetbar;
+local enemyList = uiMods.enemylist;
+local expBar = uiMods.expbar;
+local gilTracker = uiMods.giltracker;
+local inventoryTracker = uiMods.inventory.inventory;
+local satchelTracker = uiMods.inventory.satchel;
+local lockerTracker = uiMods.inventory.locker;
+local safeTracker = uiMods.inventory.safe;
+local storageTracker = uiMods.inventory.storage;
+local wardrobeTracker = uiMods.inventory.wardrobe;
+local partyList = uiMods.partylist;
+local castBar = uiMods.castbar;
+local petBar = uiMods.petbar;
+local castCost = uiMods.castcost;
+local notifications = uiMods.notifications;
+local treasurePool = uiMods.treasurepool;
+local hotbar = uiMods.hotbar;
+local macropalette = require('modules.hotbar.macropalette');
+local skillchainModule = require('modules.hotbar.skillchain');
+local configMenu = require('config');
+local debuffHandler = require('handlers.debuffhandler');
+local actionTracker = require('handlers.actiontracker');
+local mobInfo = require('modules.mobinfo.init');
+local statusHandler = require('handlers.statushandler');
+local progressbar = require('libs.progressbar');
+local diagnostics = require('libs.diagnostics');
+local TextureManager = require('libs.texturemanager');
+
+-- Global switch to hard-disable functionality that is limited on HX servers
+HzLimitedMode = false;
+
+-- Flag to skip settings_update callback during internal saves
+local bInternalSave = false;
+
+
+
+-- Local split function for hot reload (avoids monkeypatching string metatable)
+local function _split_string(str, sep)
+    sep = sep or ":";
+    local fields = {};
+    local pattern = string.format("([^%s]+)", sep);
+    str:gsub(pattern, function(c) fields[#fields + 1] = c end);
+    return fields;
 end
 
 function _check_hot_reload()
-	local path = string.gsub(addon.path, '\\\\', '\\');
+    local path = string.gsub(addon.path, '\\\\', '\\');
+    local result = io.popen("forfiles /P " .. path .. ' /M *.lua /C "cmd /c echo @file @fdate @ftime"');
+    local needsReload = false;
 
-	local result = io.popen("forfiles /P " .. path .. ' /M *.lua /C "cmd /c echo @file @fdate @ftime"');
+    for line in result:lines() do
+        if #line > 0 then
+            local splitLine = _split_string(line, " ");
+            local filename = splitLine[1];
+            local dateModified = splitLine[2];
+            local timeModified = splitLine[3];
+            filename = string.gsub(filename, '"', '');
+            local fileTable = {dateModified, timeModified};
 
-	local needsReload = false;
+            if _XIUI_DEV_HOT_RELOAD_FILES[filename] ~= nil then
+                if table.concat(_XIUI_DEV_HOT_RELOAD_FILES[filename]) ~= table.concat(fileTable) then
+                    needsReload = true;
+                    print(chat.header(addon.name):append(chat.message("Development file " .. filename .. " changed, reloading XIUI.")));
+                end
+            end
+            _XIUI_DEV_HOT_RELOAD_FILES[filename] = fileTable;
+        end
+    end
+    result:close();
 
-	for line in result:lines() do
-		if #line > 0 then
-			local splitLine = line:split(" ");
-			local filename = splitLine[1];
-			local dateModified = splitLine[2];
-			local timeModified = splitLine[3];
-
-			filename = string.gsub(filename, '"', '');
-
-			local fileTable = {dateModified, timeModified};
-
-			if _XIUI_DEV_HOT_RELOAD_FILES[filename] ~= nil then
-				if table.concat(_XIUI_DEV_HOT_RELOAD_FILES[filename]) ~= table.concat(fileTable) then
-					needsReload = true;
-					print("[XIUI] Development file " .. filename .. " changed, reloading XIUI.")
-				end
-			end
-
-			_XIUI_DEV_HOT_RELOAD_FILES[filename] = fileTable;
-		end
-	end
-
-	result:close();
-
-	if needsReload then
-		AshitaCore:GetChatManager():QueueCommand(-1, '/addon reload xiui', channelCommand);
-	end
+    if needsReload then
+        AshitaCore:GetChatManager():QueueCommand(-1, '/addon reload xiui', channelCommand);
+    end
 end
 -- ==================
 -- = /XIUI DEV ONLY =
 -- ==================
 
-local user_settings =
-T{
-	patchNotesVer = -1,
+-- Register all UI modules
+uiModules.Register('playerBar', {
+    module = playerBar,
+    settingsKey = 'playerBarSettings',
+    configKey = 'showPlayerBar',
+    hideOnEventKey = 'playerBarHideDuringEvents',
+    hideOnMenuFocusKey = 'playerBarHideOnMenuFocus',
+    hasSetHidden = true,
+});
+uiModules.Register('targetBar', {
+    module = targetBar,
+    settingsKey = 'targetBarSettings',
+    configKey = 'showTargetBar',
+    hideOnEventKey = 'targetBarHideDuringEvents',
+    hideOnMenuFocusKey = 'targetBarHideOnMenuFocus',
+    hasSetHidden = true,
+});
+uiModules.Register('enemyList', {
+    module = enemyList,
+    settingsKey = 'enemyListSettings',
+    configKey = 'showEnemyList',
+    hideOnMenuFocusKey = 'enemyListHideOnMenuFocus',
+    hasSetHidden = true,
+});
+uiModules.Register('expBar', {
+    module = expBar,
+    settingsKey = 'expBarSettings',
+    configKey = 'showExpBar',
+    hideOnMenuFocusKey = 'expBarHideOnMenuFocus',
+    hasSetHidden = true,
+});
+uiModules.Register('gilTracker', {
+    module = gilTracker,
+    settingsKey = 'gilTrackerSettings',
+    configKey = 'showGilTracker',
+    hideOnMenuFocusKey = 'gilTrackerHideOnMenuFocus',
+    hasSetHidden = true,
+});
+uiModules.Register('inventoryTracker', {
+    module = inventoryTracker,
+    settingsKey = 'inventoryTrackerSettings',
+    configKey = 'showInventoryTracker',
+    hideOnMenuFocusKey = 'inventoryTrackerHideOnMenuFocus',
+    hasSetHidden = true,
+});
+uiModules.Register('satchelTracker', {
+    module = satchelTracker,
+    settingsKey = 'satchelTrackerSettings',
+    configKey = 'showSatchelTracker',
+    hideOnMenuFocusKey = 'inventoryTrackerHideOnMenuFocus',
+    hasSetHidden = true,
+});
+uiModules.Register('lockerTracker', {
+    module = lockerTracker,
+    settingsKey = 'lockerTrackerSettings',
+    configKey = 'showLockerTracker',
+    hideOnMenuFocusKey = 'inventoryTrackerHideOnMenuFocus',
+    hasSetHidden = true,
+});
+uiModules.Register('safeTracker', {
+    module = safeTracker,
+    settingsKey = 'safeTrackerSettings',
+    configKey = 'showSafeTracker',
+    hideOnMenuFocusKey = 'inventoryTrackerHideOnMenuFocus',
+    hasSetHidden = true,
+});
+uiModules.Register('storageTracker', {
+    module = storageTracker,
+    settingsKey = 'storageTrackerSettings',
+    configKey = 'showStorageTracker',
+    hideOnMenuFocusKey = 'inventoryTrackerHideOnMenuFocus',
+    hasSetHidden = true,
+});
+uiModules.Register('wardrobeTracker', {
+    module = wardrobeTracker,
+    settingsKey = 'wardrobeTrackerSettings',
+    configKey = 'showWardrobeTracker',
+    hideOnMenuFocusKey = 'inventoryTrackerHideOnMenuFocus',
+    hasSetHidden = true,
+});
+uiModules.Register('partyList', {
+    module = partyList,
+    settingsKey = 'partyListSettings',
+    configKey = 'showPartyList',
+    hideOnEventKey = 'partyListHideDuringEvents',
+    hideOnMenuFocusKey = 'partyListHideOnMenuFocus',
+    hasSetHidden = true,
+});
+uiModules.Register('castBar', {
+    module = castBar,
+    settingsKey = 'castBarSettings',
+    configKey = 'showCastBar',
+    hideOnMenuFocusKey = 'castBarHideOnMenuFocus',
+    hasSetHidden = true,
+});
+uiModules.Register('castCost', {
+    module = castCost,
+    settingsKey = 'castCostSettings',
+    configKey = 'showCastCost',
+    hideOnMenuFocusKey = 'castCostHideOnMenuFocus',
+    hasSetHidden = true,
+});
+uiModules.Register('mobInfo', {
+    module = mobInfo.display,
+    settingsKey = 'mobInfoSettings',
+    configKey = 'showMobInfo',
+    hideOnMenuFocusKey = 'mobInfoHideOnMenuFocus',
+    hasSetHidden = true,
+});
+uiModules.Register('petBar', {
+    module = petBar,
+    settingsKey = 'petBarSettings',
+    configKey = 'showPetBar',
+    hideOnEventKey = 'petBarHideDuringEvents',
+    hideOnMenuFocusKey = 'petBarHideOnMenuFocus',
+    hasSetHidden = true,
+});
+uiModules.Register('notifications', {
+    module = notifications,
+    settingsKey = 'notificationsSettings',
+    configKey = 'showNotifications',
+    hideOnEventKey = 'notificationsHideDuringEvents',
+    hideOnMenuFocusKey = 'notificationsHideOnMenuFocus',
+    hasSetHidden = true,
+});
+uiModules.Register('treasurePool', {
+    module = treasurePool,
+    settingsKey = 'treasurePoolSettings',
+    configKey = 'treasurePoolEnabled',
+    hideOnMenuFocusKey = 'treasurePoolHideOnMenuFocus',
+    hasSetHidden = true,
+});
+uiModules.Register('hotbar', {
+    module = hotbar,
+    settingsKey = 'hotbarSettings',
+    configKey = 'showhotbar',
+    hideOnEventKey = 'hotbarHideDuringEvents',
+    hideOnMenuFocusKey = 'hotbarHideOnMenuFocus',
+    hasSetHidden = true,
+});
 
-	lockPositions = false,
-    tooltipScale = 1.0,
-    hideDuringEvents = true,
+-- Initialize settings from defaults
+gAdjustedSettings = deep_copy_table(settingsDefaults.default_settings);
+defaultUserSettings = deep_copy_table(settingsDefaults.user_settings);
 
-	showPlayerBar = true,
-	showTargetBar = true,
-	showEnemyList = true,
-	showExpBar = true,
-	showGilTracker = true,
-	showInventoryTracker = true,
-	showSatchelTracker = true,
-	showPartyList = true,
-	showCastBar = true,
+-- Run HXUI file migration BEFORE loading settings
+local migrationResult = settingsMigration.MigrateFromHXUI();
 
-	statusIconTheme = 'XIView';
-	jobIconTheme = 'FFXI',
-	fontFamily = 'Tahoma',
-	fontWeight = 'Bold', -- Options: 'Normal', 'Bold'
-	fontOutlineWidth = 2, -- Global outline width for all text (range: 0-5)
+-- ==========================================================
+-- = MIGRATION LOGIC (Legacy -> Profile System) =
+-- ==========================================================
 
-	showPartyListWhenSolo = false,
-	maxEnemyListEntries = 8,  -- Legacy, now calculated from rows * columns
-	enemyListRowsPerColumn = 8,
-	enemyListMaxColumns = 1,
-	enemyListRowSpacing = 5,
-	enemyListColumnSpacing = 10,
-	enemyListDebuffOffsetX = 0,
-	enemyListDebuffOffsetY = 0,
-	showEnemyListDebuffs = true,
-	enemyListDebuffsRightAlign = false,
-	showEnemyListTargets = false,
-	enableEnemyListClickTarget = true,
+-- Load raw settings to detect legacy data (without default filtering)
+local rawSettings = settings.load({});
 
-	playerBarScaleX = 1,
-	playerBarScaleY = 1,
-	playerBarFontSize = 12,
-	showPlayerBarBookends = true,
-	alwaysShowMpBar = true,
-	playerBarTpFlashEnabled = true,
-    playerBarHideDuringEvents = true,
-
-	targetBarScaleX = 1,
-	targetBarScaleY = 1,
-	targetBarNameFontSize = 12,
-	targetBarDistanceFontSize = 12,
-	targetBarPercentFontSize = 12,
-	targetBarCastFontSize = 12,
-	targetBarIconScale = 1,
-	targetBarIconFontSize = 10,
-	targetBarBuffsOffsetY = 4,
-	targetBarCastBarOffsetY = 6,
-	targetBarCastBarScaleX = 0.4,
-	targetBarCastBarScaleY = 1,
-	showTargetDistance = true,
-	showTargetBarBookends = true,
-	showTargetBarLockOnBorder = true,
-	showTargetBarCastBar = true,
-	showEnemyId = false;
-	alwaysShowHealthPercent = false,
-    targetBarHideDuringEvents = true,
-	splitTargetOfTarget = false,
-	totBarScaleX = 1,
-	totBarScaleY = 1,
-	totBarFontSize = 12,
-
-	enemyListScaleX = 1,
-	enemyListScaleY = 1,
-	enemyListNameFontSize = 12,
-	enemyListDistanceFontSize = 12,
-	enemyListPercentFontSize = 12,
-	enemyListIconScale = 1,
-	showEnemyDistance = false,
-	showEnemyHPPText = true,
-	showEnemyListBookends = true,
-
-	expBarScaleX = 1,
-	expBarScaleY = 1,
-	showExpBarBookends = true,
-	expBarFontSize = 12,
-    expBarShowText = true,
-    expBarShowPercent = true,
-    expBarInlineMode = false,
-    expBarLimitPointsMode = false,
-
-	gilTrackerScale = 1,
-	gilTrackerFontSize = 12,
-    gilTrackerRightAlign = false,
-
-	inventoryTrackerScale = 1,
-	inventoryTrackerFontSize = 12,
-    inventoryTrackerOpacity = 1.0,
-    inventoryTrackerColumnCount = 5,
-    inventoryTrackerRowCount = 6,
-    inventoryTrackerColorThreshold1 = 15,
-    inventoryTrackerColorThreshold2 = 29,
-    inventoryShowCount = true,
-
-	satchelTrackerScale = 1,
-	satchelTrackerFontSize = 12,
-    satchelTrackerOpacity = 1.0,
-    satchelTrackerColumnCount = 5,
-    satchelTrackerRowCount = 6,
-    satchelTrackerColorThreshold1 = 15,
-    satchelTrackerColorThreshold2 = 29,
-    satchelShowCount = true,
-
-	-- Party List global settings (shared across all parties)
-	partyListTitleFontSize = 12,
-    partyListHideDuringEvents = true,
-    partyListPreview = true,
-    partyListAlliance = true,
-
-	-- Per-party settings (Party A, B, C each have independent configurations)
-	partyA = T{
-		-- Layout mode (0 = Horizontal, 1 = Compact Vertical)
-		layout = 0,
-		-- Display options
-		showDistance = false,
-		distanceHighlight = 0,
-		showJobIcon = true,
-		showJob = true,
-		showJobLevel = true,
-		showMainJob = true,
-		showSubJob = true,
-		showCastBars = true,
-		castBarScaleY = 0.6,
-		showBookends = true,
-		showTitle = true,
-		flashTP = false,
-		showTP = true,
-		-- Appearance
-		backgroundName = 'Window1',
-		bgScale = 1.0,
-		cursor = 'GreyArrow.png',
-		statusTheme = 0, -- 0: HorizonXI, 1: HorizonXI-R, 2: FFXIV, 3: FFXI, 4: Disabled
-		statusSide = 0, -- 0: Left, 1: Right
-		buffScale = 1.0,
-		-- Positioning
-		expandHeight = false,
-		alignBottom = false,
-		minRows = 1,
-		entrySpacing = 0,
-		selectionBoxScaleY = 1,
-		-- Scale
-		scaleX = 1,
-		scaleY = 1,
-		-- Font sizes
-		fontSize = 12,
-		splitFontSizes = false,
-		nameFontSize = 12,
-		hpFontSize = 12,
-		mpFontSize = 12,
-		tpFontSize = 12,
-		distanceFontSize = 12,
-		jobFontSize = 12,
-		zoneFontSize = 10,
-		-- Job icon
-		jobIconScale = 1,
-		-- Bar scales (for all layouts)
-		hpBarScaleX = 1,
-		mpBarScaleX = 1,
-		tpBarScaleX = 1,
-		hpBarScaleY = 1,
-		mpBarScaleY = 1,
-		tpBarScaleY = 1,
-	},
-
-	partyB = T{
-		-- Layout mode (0 = Horizontal, 1 = Compact Vertical)
-		layout = 0,
-		-- Display options
-		showDistance = false,
-		distanceHighlight = 0,
-		showJobIcon = true,
-		showJob = true,
-		showJobLevel = true,
-		showMainJob = true,
-		showSubJob = true,
-		showCastBars = true,
-		castBarScaleY = 0.6,
-		showBookends = true,
-		showTitle = true,
-		flashTP = false,
-		showTP = false,
-		-- Appearance
-		backgroundName = 'Window1',
-		bgScale = 1.0,
-		cursor = 'GreyArrow.png',
-		statusTheme = 0,
-		statusSide = 0,
-		buffScale = 1.0,
-		-- Positioning
-		expandHeight = false,
-		alignBottom = false,
-		minRows = 1,
-		entrySpacing = 6,
-		selectionBoxScaleY = 1,
-		-- Scale
-		scaleX = 0.7,
-		scaleY = 0.7,
-		-- Font sizes
-		fontSize = 12,
-		splitFontSizes = false,
-		nameFontSize = 12,
-		hpFontSize = 12,
-		mpFontSize = 12,
-		tpFontSize = 12,
-		distanceFontSize = 12,
-		jobFontSize = 12,
-		zoneFontSize = 10,
-		-- Job icon
-		jobIconScale = 0.8,
-		-- Bar scales (for all layouts)
-		hpBarScaleX = 1,
-		mpBarScaleX = 1,
-		tpBarScaleX = 1,
-		hpBarScaleY = 1,
-		mpBarScaleY = 1,
-		tpBarScaleY = 1,
-	},
-
-	partyC = T{
-		-- Layout mode (0 = Horizontal, 1 = Compact Vertical)
-		layout = 0,
-		-- Display options
-		showDistance = false,
-		distanceHighlight = 0,
-		showJobIcon = true,
-		showJob = true,
-		showJobLevel = true,
-		showMainJob = true,
-		showSubJob = true,
-		showCastBars = true,
-		castBarScaleY = 0.6,
-		showBookends = true,
-		showTitle = true,
-		flashTP = false,
-		showTP = false,
-		-- Appearance
-		backgroundName = 'Window1',
-		bgScale = 1.0,
-		cursor = 'GreyArrow.png',
-		statusTheme = 0,
-		statusSide = 0,
-		buffScale = 1.0,
-		-- Positioning
-		expandHeight = false,
-		alignBottom = false,
-		minRows = 1,
-		entrySpacing = 6,
-		selectionBoxScaleY = 1,
-		-- Scale
-		scaleX = 0.7,
-		scaleY = 0.7,
-		-- Font sizes
-		fontSize = 12,
-		splitFontSizes = false,
-		nameFontSize = 12,
-		hpFontSize = 12,
-		mpFontSize = 12,
-		tpFontSize = 12,
-		distanceFontSize = 12,
-		jobFontSize = 12,
-		zoneFontSize = 10,
-		-- Job icon
-		jobIconScale = 0.8,
-		-- Bar scales (for all layouts)
-		hpBarScaleX = 1,
-		mpBarScaleX = 1,
-		tpBarScaleX = 1,
-		hpBarScaleY = 1,
-		mpBarScaleY = 1,
-		tpBarScaleY = 1,
-	},
-
-	-- Layout templates (bar dimensions and text offsets per layout mode)
-	-- These are shared across all parties using the same layout mode
-	layoutHorizontal = T{
-		hpBarWidth = 150,
-		mpBarWidth = 100,
-		tpBarWidth = 100,
-		barHeight = 20,
-		barSpacing = 8,
-		nameTextOffsetX = 1,
-		nameTextOffsetY = 0,
-		hpTextOffsetX = -2,
-		hpTextOffsetY = -1,
-		mpTextOffsetX = -2,
-		mpTextOffsetY = -1,
-		tpTextOffsetX = -2,
-		tpTextOffsetY = -1,
-	},
-
-	layoutCompact = T{
-		hpBarWidth = 200,
-		mpBarWidth = 120,
-		tpBarWidth = 0,
-		barHeight = 20,
-		barSpacing = 8,
-		nameTextOffsetX = 1,
-		nameTextOffsetY = 0,
-		hpTextOffsetX = -8,
-		hpTextOffsetY = -1,
-		mpTextOffsetX = -4,
-		mpTextOffsetY = -1,
-		tpTextOffsetX = 0,
-		tpTextOffsetY = 1,
-	},
-
-	-- Legacy settings (kept for migration, will be removed in future)
-	partyListLayout = 0,
-	partyListDistanceHighlight = 0,
-	partyListBuffScale = 1,
-	partyListCastBarScaleY = 0.6,
-	partyListCastBars = true,
-	partyListStatusTheme = 0,
-	partyListTheme = 0,
-	partyListFlashTP = false,
-	showPartyListBookends = true,
-	showPartyJobIcon = true,
-    showPartyListTitle = true,
-	showPartyListDistance = false,
-	showPartyListJob = true,
-	hidePartyListJobLevels = false,
-	hidePartyListMainJob = false,
-	hidePartyListSubJob = false,
-	partyListCursor = 'GreyArrow.png',
-	partyListBackgroundName = 'Window1',
-    partyListExpandHeight = false,
-    partyListAlignBottom = false,
-    partyListBgScale = 1.0,
-    partyListBgColor = { 255, 255, 255, 255 },
-    partyListBorderColor = { 255, 255, 255, 255 },
-
-	-- Legacy layout settings (kept for migration)
-	partyListLayout1 = T{
-		partyListScaleX = 1,
-		partyListScaleY = 1,
-		partyListFontSize = 12,
-		splitFontSizes = false,
-		partyListNameFontSize = 12,
-		partyListHpFontSize = 12,
-		partyListMpFontSize = 12,
-		partyListTpFontSize = 12,
-		partyListDistanceFontSize = 12,
-		partyListJobFontSize = 12,
-		partyListJobIconScale = 1,
-		partyListEntrySpacing = 0,
-		partyListTP = true,
-		partyListMinRows = 1,
-		selectionBoxScaleY = 1,
-		partyList2ScaleX = 0.7,
-		partyList2ScaleY = 0.7,
-		partyList2FontSize = 12,
-		partyList2NameFontSize = 12,
-		partyList2HpFontSize = 12,
-		partyList2MpFontSize = 12,
-		partyList2TpFontSize = 12,
-		partyList2DistanceFontSize = 12,
-		partyList2JobFontSize = 12,
-		partyList2JobIconScale = 0.8,
-		partyList2EntrySpacing = 6,
-		partyList2TP = false,
-		partyList3ScaleX = 0.7,
-		partyList3ScaleY = 0.7,
-		partyList3FontSize = 12,
-		partyList3NameFontSize = 12,
-		partyList3HpFontSize = 12,
-		partyList3MpFontSize = 12,
-		partyList3TpFontSize = 12,
-		partyList3DistanceFontSize = 12,
-		partyList3JobFontSize = 12,
-		partyList3JobIconScale = 0.8,
-		partyList3EntrySpacing = 6,
-		partyList3TP = false,
-		hpBarWidth = 150,
-		mpBarWidth = 100,
-		tpBarWidth = 100,
-		barHeight = 20,
-		barSpacing = 8,
-		hpBarScaleX = 1,
-		mpBarScaleX = 1,
-		hpBarScaleY = 1,
-		mpBarScaleY = 1,
-		nameTextOffsetX = 1,
-		nameTextOffsetY = 0,
-		hpTextOffsetX = -2,
-		hpTextOffsetY = -1,
-		mpTextOffsetX = -2,
-		mpTextOffsetY = -1,
-		tpTextOffsetX = -2,
-		tpTextOffsetY = -1,
-	},
-
-	partyListLayout2 = T{
-		partyListScaleX = 1,
-		partyListScaleY = 1,
-		partyListFontSize = 12,
-		splitFontSizes = true,
-		partyListNameFontSize = 12,
-		partyListHpFontSize = 12,
-		partyListMpFontSize = 12,
-		partyListTpFontSize = 12,
-		partyListDistanceFontSize = 12,
-		partyListJobFontSize = 12,
-		partyListJobIconScale = 1,
-		partyListEntrySpacing = 3,
-		partyListTP = true,
-		partyListMinRows = 1,
-		selectionBoxScaleY = 1,
-		partyList2ScaleX = 0.55,
-		partyList2ScaleY = 0.55,
-		partyList2FontSize = 12,
-		partyList2NameFontSize = 12,
-		partyList2HpFontSize = 12,
-		partyList2MpFontSize = 12,
-		partyList2TpFontSize = 12,
-		partyList2DistanceFontSize = 12,
-		partyList2JobFontSize = 12,
-		partyList2JobIconScale = 0.65,
-		partyList2EntrySpacing = 1,
-		partyList2TP = true,
-		partyList2HpBarScaleX = 0.9,
-		partyList2MpBarScaleX = 0.6,
-		partyList2HpBarScaleY = 1,
-		partyList2MpBarScaleY = 0.7,
-		partyList3ScaleX = 0.55,
-		partyList3ScaleY = 0.55,
-		partyList3FontSize = 12,
-		partyList3NameFontSize = 12,
-		partyList3HpFontSize = 12,
-		partyList3MpFontSize = 12,
-		partyList3TpFontSize = 12,
-		partyList3DistanceFontSize = 12,
-		partyList3JobFontSize = 12,
-		partyList3JobIconScale = 0.65,
-		partyList3EntrySpacing = 1,
-		partyList3TP = true,
-		partyList3HpBarScaleX = 0.9,
-		partyList3MpBarScaleX = 0.6,
-		partyList3HpBarScaleY = 1,
-		partyList3MpBarScaleY = 0.7,
-		hpBarWidth = 200,
-		mpBarWidth = 120,
-		tpBarWidth = 0,
-		barHeight = 20,
-		barSpacing = 8,
-		hpBarScaleX = 0.9,
-		mpBarScaleX = 0.6,
-		hpBarScaleY = 1,
-		mpBarScaleY = 0.7,
-		nameTextOffsetX = 1,
-		nameTextOffsetY = 0,
-		hpTextOffsetX = -8,
-		hpTextOffsetY = -1,
-		mpTextOffsetX = -4,
-		mpTextOffsetY = -1,
-		tpTextOffsetX = 0,
-		tpTextOffsetY = 1,
-	},
-
-	castBarScaleX = 1,
-	castBarScaleY = 1,
-	showCastBarBookends = true,
-	castBarFontSize = 12,
-	castBarFastCastEnabled = false,
-	castBarFastCastRDMSJ = 0.17,
-	castBarFastCastWHMCureSpeed = 0.15,
-	castBarFastCastBRDSingSpeed = 0.37,
-	castBarFastCast = {
-		[1] = 0.02, -- WAR
-		[2] = 0.02, -- MNK
-		[3] = 0.04, -- WHM
-		[4] = 0.04, -- BLM
-		[5] = 0.42, -- RDM
-		[6] = 0.07, -- THF
-		[7] = 0.07, -- PLD
-		[8] = 0.07, -- DRK
-		[9] = 0.02, -- BST
-		[10] = 0.04, -- BRD
-		[11] = 0.02, -- RNG
-		[12] = 0.02, -- SAM
-		[13] = 0.02, -- NIN
-		[14] = 0.07, -- DRG
-		[15] = 0.04, -- SMN
-		[16] = 0.07, -- BLU
-		[17] = 0.02, -- COR
-		[18] = 0.04, -- PUP
-		[19] = 0.02, -- DNC
-		[20] = 0.02, -- SCH
-		[21] = 0.02, -- GEO
-		[22] = 0.02, -- RUN
-	},
-
-	-- Bar Settings (global progress bar configuration)
-	showBookends = true,            -- Global bookend visibility (overrides individual bookend settings)
-	bookendSize = 10,               -- Minimum bookend width in pixels (5-20)
-	healthBarFlashEnabled = true,   -- Flash effect when taking damage
-	noBookendRounding = 4,          -- Bar roundness for bars without bookends (0-10)
-	barBorderThickness = 1,         -- Border thickness for all progress bars (1-5)
-
-	-- Color customization settings
-	colorCustomization = T{
-		-- Player Bar
-		playerBar = T{
-			hpGradient = T{
-				low = T{ enabled = true, start = '#ec3232', stop = '#f16161' },      -- 0-25%
-				medLow = T{ enabled = true, start = '#ee9c06', stop = '#ecb44e' },   -- 25-50%
-				medHigh = T{ enabled = true, start = '#ffff0c', stop = '#ffff97' },  -- 50-75%
-				high = T{ enabled = true, start = '#e26c6c', stop = '#fa9c9c' },     -- 75-100%
-			},
-			mpGradient = T{ enabled = true, start = '#9abb5a', stop = '#bfe07d' },
-			tpGradient = T{ enabled = true, start = '#3898ce', stop = '#78c4ee' },
-			tpOverlayGradient = T{ enabled = true, start = '#0078CC', stop = '#0078CC' },  -- TP overlay bar (1000+ stored)
-			hpTextColor = 0xFFFFFFFF,
-			mpTextColor = 0xFFdef2db,
-			tpEmptyTextColor = 0xFF9acce8,  -- TP < 1000
-			tpFullTextColor = 0xFF2fa9ff,   -- TP >= 1000
-			tpFlashColor = 0xFF2fa9ff,      -- TP flash effect color
-		},
-
-		-- Target Bar
-		targetBar = T{
-			hpGradient = T{ enabled = true, start = '#e26c6c', stop = '#fb9494' },
-			castBarGradient = T{ enabled = true, start = '#ffaa00', stop = '#ffcc44' },
-			distanceTextColor = 0xFFFFFFFF,
-			castTextColor = 0xFFFFAA00,  -- Orange color for enemy casting
-			-- Note: HP percent text color is set dynamically based on HP amount
-			-- Note: Entity name colors are in shared section
-		},
-
-		-- Target of Target Bar
-		totBar = T{
-			hpGradient = T{ enabled = true, start = '#e16c6c', stop = '#fb9494' },
-		},
-
-		-- Enemy List
-		enemyList = T{
-			hpGradient = T{ enabled = true, start = '#e16c6c', stop = '#fb9494' },
-			distanceTextColor = 0xFFFFFFFF,
-			percentTextColor = 0xFFFFFFFF,
-			targetBorderColor = 0xFFFFFFFF,      -- white - border for main target
-			subtargetBorderColor = 0xFF8080FF,   -- blue - border for subtarget
-			-- Note: Entity name colors are in shared section
-		},
-
-		-- Party List (per-party color settings)
-		partyListA = T{
-			hpGradient = T{
-				low = T{ enabled = true, start = '#ec3232', stop = '#f16161' },
-				medLow = T{ enabled = true, start = '#ee9c06', stop = '#ecb44e' },
-				medHigh = T{ enabled = true, start = '#ffff0c', stop = '#ffff97' },
-				high = T{ enabled = true, start = '#e26c6c', stop = '#fa9c9c' },
-			},
-			mpGradient = T{ enabled = true, start = '#9abb5a', stop = '#bfe07d' },
-			tpGradient = T{ enabled = true, start = '#3898ce', stop = '#78c4ee' },
-			castBarGradient = T{ enabled = true, start = '#ffaa00', stop = '#ffcc44' },
-			barBackgroundOverride = T{ active = false, enabled = true, start = '#01122b', stop = '#061c39' },
-			barBorderOverride = T{ active = false, color = '#01122b' },
-			nameTextColor = 0xFFFFFFFF,
-			hpTextColor = 0xFFFFFFFF,
-			mpTextColor = 0xFFFFFFFF,
-			tpEmptyTextColor = 0xFF9acce8,
-			tpFullTextColor = 0xFF2fa9ff,
-			tpFlashColor = 0xFF3ECE00,
-			bgColor = 0xFFFFFFFF,
-			borderColor = 0xFFFFFFFF,
-			selectionGradient = T{ enabled = true, start = '#4da5d9', stop = '#78c0ed' },
-			selectionBorderColor = 0xFF78C0ED,
-			subtargetGradient = T{ enabled = true, start = '#d9a54d', stop = '#edcf78' },
-			subtargetBorderColor = 0xFFfdd017,
-		},
-		partyListB = T{
-			hpGradient = T{
-				low = T{ enabled = true, start = '#ec3232', stop = '#f16161' },
-				medLow = T{ enabled = true, start = '#ee9c06', stop = '#ecb44e' },
-				medHigh = T{ enabled = true, start = '#ffff0c', stop = '#ffff97' },
-				high = T{ enabled = true, start = '#e26c6c', stop = '#fa9c9c' },
-			},
-			mpGradient = T{ enabled = true, start = '#9abb5a', stop = '#bfe07d' },
-			barBackgroundOverride = T{ active = false, enabled = true, start = '#01122b', stop = '#061c39' },
-			barBorderOverride = T{ active = false, color = '#01122b' },
-			nameTextColor = 0xFFFFFFFF,
-			hpTextColor = 0xFFFFFFFF,
-			mpTextColor = 0xFFFFFFFF,
-			tpEmptyTextColor = 0xFF9acce8,
-			tpFullTextColor = 0xFF2fa9ff,
-			tpFlashColor = 0xFF3ECE00,
-			bgColor = 0xFFFFFFFF,
-			borderColor = 0xFFFFFFFF,
-			selectionGradient = T{ enabled = true, start = '#4da5d9', stop = '#78c0ed' },
-			selectionBorderColor = 0xFF78C0ED,
-			subtargetGradient = T{ enabled = true, start = '#d9a54d', stop = '#edcf78' },
-			subtargetBorderColor = 0xFFfdd017,
-		},
-		partyListC = T{
-			hpGradient = T{
-				low = T{ enabled = true, start = '#ec3232', stop = '#f16161' },
-				medLow = T{ enabled = true, start = '#ee9c06', stop = '#ecb44e' },
-				medHigh = T{ enabled = true, start = '#ffff0c', stop = '#ffff97' },
-				high = T{ enabled = true, start = '#e26c6c', stop = '#fa9c9c' },
-			},
-			mpGradient = T{ enabled = true, start = '#9abb5a', stop = '#bfe07d' },
-			barBackgroundOverride = T{ active = false, enabled = true, start = '#01122b', stop = '#061c39' },
-			barBorderOverride = T{ active = false, color = '#01122b' },
-			nameTextColor = 0xFFFFFFFF,
-			hpTextColor = 0xFFFFFFFF,
-			mpTextColor = 0xFFFFFFFF,
-			tpEmptyTextColor = 0xFF9acce8,
-			tpFullTextColor = 0xFF2fa9ff,
-			tpFlashColor = 0xFF3ECE00,
-			bgColor = 0xFFFFFFFF,
-			borderColor = 0xFFFFFFFF,
-			selectionGradient = T{ enabled = true, start = '#4da5d9', stop = '#78c0ed' },
-			selectionBorderColor = 0xFF78C0ED,
-			subtargetGradient = T{ enabled = true, start = '#d9a54d', stop = '#edcf78' },
-			subtargetBorderColor = 0xFFfdd017,
-		},
-
-		-- Exp Bar
-		expBar = T{
-			barGradient = T{ enabled = true, start = '#c39040', stop = '#e9c466' },
-			jobTextColor = 0xFFFFFFFF,
-			expTextColor = 0xFFFFFFFF,
-			percentTextColor = 0xFFFFFF00,
-		},
-
-		-- Gil Tracker
-		gilTracker = T{
-			textColor = 0xFFFFFFFF,
-		},
-
-		-- Inventory Tracker
-		inventoryTracker = T{
-			textColor = 0xFFFFFFFF,
-			emptySlotColor = T{ r = 0, g = 0.07, b = 0.17, a = 1 },
-			usedSlotColor = T{ r = 0.37, g = 0.7, b = 0.88, a = 1 },        -- Normal (white/blue)
-			usedSlotColorThreshold1 = T{ r = 1.0, g = 1.0, b = 0, a = 1 },  -- Warning (yellow)
-			usedSlotColorThreshold2 = T{ r = 1.0, g = 0, b = 0, a = 1 },    -- Critical (red)
-		},
-
-		-- Satchel Tracker
-		satchelTracker = T{
-			textColor = 0xFFFFFFFF,
-			emptySlotColor = T{ r = 0, g = 0.07, b = 0.17, a = 1 },
-			usedSlotColor = T{ r = 0.37, g = 0.7, b = 0.88, a = 1 },        -- Normal (white/blue)
-			usedSlotColorThreshold1 = T{ r = 1.0, g = 1.0, b = 0, a = 1 },  -- Warning (yellow)
-			usedSlotColorThreshold2 = T{ r = 1.0, g = 0, b = 0, a = 1 },    -- Critical (red)
-		},
-
-		-- Cast Bar
-		castBar = T{
-			barGradient = T{ enabled = true, start = '#3798ce', stop = '#78c5ee' },
-			spellTextColor = 0xFFFFFFFF,
-			percentTextColor = 0xFFFFFFFF,
-		},
-
-		-- Global/Shared
-		shared = T{
-			backgroundGradient = T{ enabled = true, start = '#01122b', stop = '#061c39' },
-			bookendGradient = T{ start = '#576C92', mid = '#B7C9FF', stop = '#576C92' },
-			-- Entity name colors (used by target bar, enemy list, etc.)
-			playerPartyTextColor = 0xFF00FFFF,     -- cyan - party/alliance members
-			playerOtherTextColor = 0xFFFFFFFF,     -- white - other players
-			npcTextColor = 0xFF66FF66,             -- green - NPCs
-			mobUnclaimedTextColor = 0xFFFFFF66,    -- yellow - unclaimed mobs
-			mobPartyClaimedTextColor = 0xFFFF6666, -- red - mobs claimed by party
-			mobOtherClaimedTextColor = 0xFFFF66FF, -- magenta - mobs claimed by others
-			-- HP bar interpolation effect colors
-			hpDamageGradient = T{ enabled = true, start = '#cf3437', stop = '#c54d4d' },
-			hpDamageFlashColor = '#ffacae',
-			hpHealGradient = T{ enabled = true, start = '#4ade80', stop = '#86efac' },
-			hpHealFlashColor = '#c8ffc8',
-		},
-	},
-};
-
-local user_settings_container =
-T{
-	userSettings = user_settings;
-};
-
-local default_settings =
-T{
-	-- global settings
-	currentPatchVer = 2,
-	tpEmptyColor = 0xFF9acce8,
-	tpFullColor = 0xFF2fa9ff,
-	mpColor = 0xFFdef2db,
-
-	-- settings for the targetbar
-	targetBarSettings =
-	T{
-		-- Damage interpolation
-		hitInterpolationDecayPercentPerSecond = 150,
-		hitDelayDuration = 0.5,
-		hitFlashDuration = 0.4,
-
-		-- Everything else
-		barWidth = 500,
-		barHeight = 18,
-		totBarHeight = 14,
-		totBarOffset = -1,
-		textScale = 1.2,
-		cornerOffset = 5,
-		nameXOffset = 12,
-		nameYOffset = 9,
-		iconSize = 22,
-		arrowSize = 30,
-		maxIconColumns = 12,
-		topTextYOffset = 6,
-		topTextXOffset = 5,
-		bottomTextYOffset = 0,
-		bottomTextXOffset = 15,
-		-- Buff/Debuff positioning
-		buffsOffsetY = 4,
-		-- Cast bar positioning and scaling
-		castBarOffsetY = 6,
-		castBarOffsetX = 12,
-		castBarWidth = 500,  -- Base width (will be adjusted by scale and inset)
-		name_font_settings =
-		T{
-			font_alignment = gdi.Alignment.Left,
-			font_family = 'Consolas',
-			font_height = 13,
-			font_color = 0xFFFFFFFF,
-			font_flags = gdi.FontFlags.None,
-			outline_color = 0xFF000000,
-			outline_width = 2,
-		};
-		totName_font_settings =
-		T{
-			font_alignment = gdi.Alignment.Left,
-			font_family = 'Consolas',
-			font_height = 12,
-			font_color = 0xFFFFFFFF,
-			font_flags = gdi.FontFlags.None,
-			outline_color = 0xFF000000,
-			outline_width = 2,
-		};
-		distance_font_settings =
-		T{
-			font_alignment = gdi.Alignment.Right,
-			font_family = 'Consolas',
-			font_height = 11,
-			font_color = 0xFFFFFFFF,
-			font_flags = gdi.FontFlags.None,
-			outline_color = 0xFF000000,
-			outline_width = 2,
-		};
-		percent_font_settings =
-		T{
-			font_alignment = gdi.Alignment.Right,
-			font_family = 'Consolas',
-			font_height = 11,
-			font_color = 0xFFFFFFFF,
-			font_flags = gdi.FontFlags.None,
-			outline_color = 0xFF000000,
-			outline_width = 2,
-		};
-		cast_font_settings =
-		T{
-			font_alignment = gdi.Alignment.Center,
-			font_family = 'Consolas',
-			font_height = 12,
-			font_color = 0xFFFFAA00,
-			font_flags = gdi.FontFlags.None,
-			outline_color = 0xFF000000,
-			outline_width = 2,
-		};
-	};
-
-	-- settings for the playerbar
-	playerBarSettings =
-	T{
-		-- Damage interpolation
-		hitInterpolationDecayPercentPerSecond = 150,
-		hitDelayDuration = 0.5,
-		hitFlashDuration = 0.4,
-		barWidth = 500,
-		barSpacing = 10,
-		barHeight = 20,
-		textYOffset = -1,
-		font_settings =
-		T{
-			font_alignment = gdi.Alignment.Right,
-			font_family = 'Consolas',
-			font_height = 15,
-			font_color = 0xFFFFFFFF,
-			font_flags = gdi.FontFlags.None,
-			outline_color = 0xFF000000,
-			outline_width = 2,
-		};
-	};
-
-	-- settings for enemy list
-	enemyListSettings =
-	T{
-		barWidth = 125;
-		barHeight = 10;
-		textScale = 1;
-		entrySpacing = 1;
-		bgPadding = 7;
-		bgTopPadding = -3;
-		maxIcons = 5;
-		iconSize = 18;
-		debuffOffsetX = -10;
-		debuffOffsetY = 0;
-		name_font_settings =
-		T{
-			font_alignment = gdi.Alignment.Left,
-			font_family = 'Consolas',
-			font_height = 11,
-			font_color = 0xFFFFFFFF,
-			font_flags = gdi.FontFlags.None,
-			outline_color = 0xFF000000,
-			outline_width = 2,
-		};
-		distance_font_settings =
-		T{
-			font_alignment = gdi.Alignment.Left,
-			font_family = 'Consolas',
-			font_height = 9,
-			font_color = 0xFFFFFFFF,
-			font_flags = gdi.FontFlags.None,
-			outline_color = 0xFF000000,
-			outline_width = 2,
-		};
-		percent_font_settings =
-		T{
-			font_alignment = gdi.Alignment.Right,
-			font_family = 'Consolas',
-			font_height = 9,
-			font_color = 0xFFFFFFFF,
-			font_flags = gdi.FontFlags.None,
-			outline_color = 0xFF000000,
-			outline_width = 2,
-		};
-		prim_data = {
-			texture_offset_x= 0.0,
-			texture_offset_y= 0.0,
-			border_visible  = false,
-			border_flags    = FontBorderFlags.None,
-			border_sizes    = '0,0,0,0',
-			visible         = false,
-			position_x      = 0,
-			position_y      = 0,
-			can_focus       = true,
-			locked          = false,
-			lockedz         = false,
-			scale_x         = 1.0,
-			scale_y         = 1.0,
-			width           = 0.0,
-			height          = 0.0,
-			color           = 0xFFFFFFFF,
-		};
-	};
-
-	-- settings for the exp bar
-	expBarSettings =
-	T{
-		barWidth = 550;
-		barHeight = 12;
-		textOffsetY = 4;
-		percentOffsetX = -5;
-		job_font_settings =
-		T{
-			font_alignment = gdi.Alignment.Left,
-			font_family = 'Consolas',
-			font_height = 11,
-			font_color = 0xFFFFFFFF,
-			font_flags = gdi.FontFlags.None,
-			outline_color = 0xFF000000,
-			outline_width = 2,
-		};
-		exp_font_settings =
-		T{
-			font_alignment = gdi.Alignment.Right,
-			font_family = 'Consolas',
-			font_height = 11,
-			font_color = 0xFFFFFFFF,
-			font_flags = gdi.FontFlags.None,
-			outline_color = 0xFF000000,
-			outline_width = 2,
-		};
-		percent_font_settings =
-		T{
-			font_alignment = gdi.Alignment.Right,
-			font_family = 'Consolas',
-			font_height = 8,
-			font_color = 0xFFFFFF00,
-			font_flags = gdi.FontFlags.None,
-			outline_color = 0xFF000000,
-			outline_width = 2,
-		};
-	};
-
-	-- settings for gil tracker
-	gilTrackerSettings =
-	T{
-		iconScale = 30;
-		font_settings =
-		T{
-			font_family = 'Consolas',
-			font_height = 13,
-			font_color = 0xFFFFFFFF,
-			font_flags = gdi.FontFlags.None,
-			outline_color = 0xFF000000,
-			outline_width = 2,
-		};
-	};
-
-	inventoryTrackerSettings = 
-	T{
-		columnCount = 5;
-		rowCount = 6;
-		dotRadius = 5;
-		dotSpacing = 1;
-		groupSpacing = 8;
-		textOffsetY = -3;
-		font_settings =
-		T{
-			font_alignment = gdi.Alignment.Right,
-			font_family = 'Consolas',
-			font_height = 13,
-			font_color = 0xFFFFFFFF,
-			font_flags = gdi.FontFlags.None,
-			outline_color = 0xFF000000,
-			outline_width = 2,
-		};
-	};
-
-	satchelTrackerSettings = 
-	T{
-		columnCount = 5;
-		rowCount = 10;
-		dotRadius = 5;
-		dotSpacing = 1;
-		groupSpacing = 8;
-		textOffsetY = -3;
-		font_settings =
-		T{
-			font_alignment = gdi.Alignment.Right,
-			font_family = 'Consolas',
-			font_height = 13,
-			font_color = 0xFFFFFFFF,
-			font_flags = gdi.FontFlags.None,
-			outline_color = 0xFF000000,
-			outline_width = 2,
-		};
-	};
-
-	partyListSettings =
-	T{
-		-- Damage interpolation
-		hitInterpolationDecayPercentPerSecond = 150,
-		hitDelayDuration = 0.5,
-		hitFlashDuration = 0.4,
-		hpBarWidth = 150,
-		tpBarWidth = 100,
-		mpBarWidth = 100,
-		barHeight = 20,
-		barSpacing = 8,
-
-		nameTextOffsetX = 1,
-		nameTextOffsetY = 0,
-		hpTextOffsetX = -2,
-		hpTextOffsetY = -1,
-		mpTextOffsetX = -2,
-		mpTextOffsetY = -1,
-		tpTextOffsetX = -2,
-		tpTextOffsetY = -1,
-
-		borderSize = 21,
-        bgPadding = 4,
-        bgPaddingY = 10,
-        bgOffset = 1,
-
-		cursorPaddingX1 = 8,
-		cursorPaddingX2 = 8,
-		cursorPaddingY1 = 7,
-		cursorPaddingY2 = 10,
-		dotRadius = 3,
-
-		arrowSize = 1;
-
-		subtargetArrowTint = 0xFFfdd017,
-		targetArrowTint = 0xFFFFFFFF,
-
-		iconSize = 22,
-		maxIconColumns = 6,
-		buffOffset = 10,
-		xivBuffOffsetY = 1,
-		entrySpacing = 8,
-        expandHeight = false,
-        alignBottom = false,
-        minRows = 1,
-
-		hp_font_settings =
-		T{
-			font_alignment = gdi.Alignment.Right,
-			font_family = 'Consolas',
-			font_height = 13,
-			font_color = 0xFFFFFFFF,
-			font_flags = gdi.FontFlags.None,
-			outline_color = 0xFF000000,
-			outline_width = 2,
-		};
-		mp_font_settings =
-		T{
-			font_alignment = gdi.Alignment.Left,
-			font_family = 'Consolas',
-			font_height = 12,
-			font_color = 0xFFFFFFFF,
-			font_flags = gdi.FontFlags.None,
-			outline_color = 0xFF000000,
-			outline_width = 2,
-		};
-		tp_font_settings =
-		T{
-			font_alignment = gdi.Alignment.Left,
-			font_family = 'Consolas',
-			font_height = 12,
-			font_color = 0xFFFFFFFF,
-			font_flags = gdi.FontFlags.None,
-			outline_color = 0xFF000000,
-			outline_width = 2,
-		};
-		name_font_settings =
-		T{
-			font_alignment = gdi.Alignment.Left,
-			font_family = 'Consolas',
-			font_height = 13,
-			font_color = 0xFFFFFFFF,
-			font_flags = gdi.FontFlags.None,
-			outline_color = 0xFF000000,
-			outline_width = 2,
-		};
-		title_font_settings =
-		T{
-			font_alignment = gdi.Alignment.None,
-			font_family = 'Consolas',
-			font_height = 14,
-			font_color = 0xFFC5CFDC,
-			font_flags = gdi.FontFlags.Italic,
-			outline_color = 0xFF000000,
-			outline_width = 2,
-		};
-		prim_data = {
-			texture_offset_x= 0.0,
-			texture_offset_y= 0.0,
-			border_visible  = false,
-			border_flags    = FontBorderFlags.None,
-			border_sizes    = '0,0,0,0',
-			visible         = true,
-			position_x      = 0,
-			position_y      = 0,
-			can_focus       = false,
-			locked          = true,
-			lockedz         = true,
-			scale_x         = 1.0,
-			scale_y         = 1.0,
-			width           = 0.0,
-			height          = 0.0,
-		};
-	};
-
-	castBarSettings =
-	T{
-		barWidth = 500,
-		barHeight = 20,
-		spellOffsetY = 2,
-		percentOffsetY = 2,
-		percentOffsetX = -10,
-		spell_font_settings =
-		T{
-            font_alignment = gdi.Alignment.Left,
-			font_family = 'Consolas',
-			font_height = 15,
-			font_color = 0xFFFFFFFF,
-			font_flags = gdi.FontFlags.None,
-			outline_color = 0xFF000000,
-            outline_width = 2,
-		};
-		percent_font_settings =
-		T{
-            font_alignment = gdi.Alignment.Right,
-			font_family = 'Consolas',
-			font_height = 15,
-			font_color = 0xFFFFFFFF,
-			font_flags = gdi.FontFlags.None,
-			outline_color = 0xFF000000,
-            outline_width = 2,
-		};
-	};
-};
-
-gAdjustedSettings = deep_copy_table(default_settings);
-defaultUserSettings = deep_copy_table(user_settings);
-
--- Migrate settings from HXUI to XIUI (one-time migration for users upgrading from HXUI)
-local function MigrateFromHXUI()
-    local installPath = AshitaCore:GetInstallPath():gsub('\\$', ''); -- Remove trailing backslash if present
-    local oldConfigDir = installPath .. '\\config\\addons\\HXUI';
-    local newConfigDir = installPath .. '\\config\\addons\\XIUI';
-
-    -- Check if old config directory exists
-    if not ashita.fs.exists(oldConfigDir) then
-        return;
+-- 1. Check for intermediate "profiles" table (from recent dev versions)
+if (rawSettings.profiles ~= nil) then
+    print(chat.header(addon.name):append(chat.message('Migrating internal profiles to file system...')));
+    local globalProfiles = profileManager.GetGlobalProfiles();
+    
+    for name, data in pairs(rawSettings.profiles) do
+        if not profileManager.ProfileExists(name) then
+            profileManager.SaveProfileSettings(name, data);
+        end
+        if not table.contains(globalProfiles.names, name) then
+            table.insert(globalProfiles.names, name);
+            table.insert(globalProfiles.order, name);
+        end
     end
+    profileManager.SaveGlobalProfiles(globalProfiles);
+    
+    -- Clean up
+    rawSettings.profiles = nil;
+    rawSettings.profileOrder = nil;
+    settings.save();
+end
 
-    -- Get all character folders in the old config directory
-    local characterFolders = ashita.fs.get_directory(oldConfigDir);
-    if characterFolders == nil then
-        return;
-    end
+-- 2. Check for legacy flat settings (Global Scan)
+local function MigrateAllLegacySettings()
+    local installPath = AshitaCore:GetInstallPath();
+    local xiuiPath = installPath .. 'config\\addons\\xiui\\';
+    local imguiPath = installPath .. 'config\\imgui.ini';
+    local legacyFound = false;
 
-    local migratedCount = 0;
-
-    for _, folderName in ipairs(characterFolders) do
-        local oldSettingsPath = oldConfigDir .. '\\' .. folderName .. '\\settings.lua';
-        local newSettingsDir = newConfigDir .. '\\' .. folderName;
-        local newSettingsPath = newSettingsDir .. '\\settings.lua';
-
-        -- Only migrate if old settings exist and new settings don't
-        if ashita.fs.exists(oldSettingsPath) and not ashita.fs.exists(newSettingsPath) then
-            -- Ensure the new directory exists
-            ashita.fs.create_directory(newSettingsDir);
-
-            -- Read old settings file
-            local oldFile = io.open(oldSettingsPath, 'rb');
-            if oldFile then
-                local content = oldFile:read('*all');
-                oldFile:close();
-
-                -- Write to new settings file
-                local newFile = io.open(newSettingsPath, 'wb');
-                if newFile then
-                    newFile:write(content);
-                    newFile:close();
-                    migratedCount = migratedCount + 1;
+    local function GetCharacterFolders()
+        local folders = {};
+        local directories = ashita.fs.get_directory(xiuiPath);
+        if directories then
+            for _, dir in ipairs(directories) do
+                local name, id = string.match(dir, "^([%a]+)_(%d+)$");
+                if name and id then
+                    table.insert(folders, { name = name, id = id, dir = dir });
                 end
             end
         end
+        return folders;
     end
 
-    if migratedCount > 0 then
-        print('[XIUI] Successfully migrated settings for ' .. migratedCount .. ' character(s) from HXUI.');
+    local charFolders = GetCharacterFolders();
+
+    -- Iterate and check for legacy settings
+    for _, char in ipairs(charFolders) do
+        local settingsPath = xiuiPath .. char.dir .. '\\settings.lua';
+        
+        if (ashita.fs.exists(settingsPath)) then
+            -- Safely load settings table
+            local success, result = pcall(dofile, settingsPath);
+            
+            if (success and type(result) == 'table' and result.currentProfile == nil and next(result) ~= nil) then
+                -- FOUND LEGACY SETTINGS
+                
+                -- 1. Create global imgui.ini backup (Once)
+                if (not legacyFound) then
+                    legacyFound = true;
+                    if (ashita.fs.exists(imguiPath)) then
+                        profileManager.EnsureBackupDirectory(profileManager.LegacyXiuiBackupPath);
+                        local backupImguiPath = profileManager.LegacyXiuiBackupPath .. 'imgui.ini';
+                        
+                        if profileManager.CopyFile(imguiPath, backupImguiPath) then
+                            print(chat.header(addon.name):append(chat.message('Created legacy imgui.ini backup at: ')):append(chat.success(backupImguiPath)));
+                        end
+                    end
+                end
+                
+                -- 2. Backup character settings to backups/legacy/xiui/CharName/settings.lua
+                local backupCharPath = profileManager.LegacyXiuiBackupPath .. char.name .. '\\';
+                profileManager.EnsureBackupDirectory(backupCharPath);
+                
+                local backupSettingsPath = backupCharPath .. 'settings.lua';
+                if profileManager.CopyFile(settingsPath, backupSettingsPath) then
+                     print(chat.header(addon.name):append(chat.message('Created legacy settings backup at: ')):append(chat.success(backupSettingsPath)));
+                end
+                
+                -- 3. Create Legacy Profile
+                local profileName = 'Legacy ' .. char.name;
+                local legacyData = deep_copy_table(defaultUserSettings);
+                
+                -- Merge settings
+                if (result.userSettings ~= nil and type(result.userSettings) == 'table') then
+                    for k, v in pairs(result.userSettings) do legacyData[k] = v; end
+                    for k, v in pairs(result) do
+                        if (k ~= 'profiles' and k ~= 'profileOrder' and k ~= 'userSettings' and result.userSettings[k] == nil) then
+                            legacyData[k] = v;
+                        end
+                    end
+                else
+                    for k, v in pairs(result) do
+                        if (k ~= 'profiles' and k ~= 'profileOrder') then
+                            legacyData[k] = v;
+                        end
+                    end
+                end
+                
+                -- Import window positions from imgui.ini (if available)
+                local legacyPositions = profileManager.GetImguiPositions();
+                if (legacyPositions) then
+                    legacyData.windowPositions = legacyPositions;
+                end
+                
+                -- Save Profile
+                profileManager.SaveProfileSettings(profileName, legacyData);
+                
+                -- Register Global Profile
+                local globalProfiles = profileManager.GetGlobalProfiles();
+                if not table.contains(globalProfiles.names, profileName) then
+                    table.insert(globalProfiles.names, profileName);
+                    table.insert(globalProfiles.order, profileName);
+                    profileManager.SaveGlobalProfiles(globalProfiles);
+                end
+                
+                -- 4. Update settings.lua
+                local f = io.open(settingsPath, "w+");
+                if f then
+                    f:write("local settings = {};\n");
+                    f:write(string.format("settings[\"currentProfile\"] = %q;\n", profileName));
+                    f:write("return settings;\n");
+                    f:close();
+                end
+                
+                print(chat.header(addon.name):append(chat.message('Migrated ' .. char.name .. ' to profile: ')):append(chat.success(profileName)));
+            end
+        end
     end
 end
 
--- Run migration before loading settings
-pcall(MigrateFromHXUI);
+MigrateAllLegacySettings();
 
-local config = settings.load(user_settings_container);
-gConfig = config.userSettings;
-
--- Migrate existing users to new settings (add missing fields from defaults)
-if gConfig.colorCustomization and gConfig.colorCustomization.shared then
-	-- Add bookend gradient if missing
-	if not gConfig.colorCustomization.shared.bookendGradient then
-		gConfig.colorCustomization.shared.bookendGradient = deep_copy_table(defaultUserSettings.colorCustomization.shared.bookendGradient);
-	end
+-- Check for addon update and backup profiles if needed
+local globalProfiles = profileManager.GetGlobalProfiles();
+if (globalProfiles.version ~= addon.version) then
+    local oldVer = globalProfiles.version and ('v' .. globalProfiles.version) or 'unknown';
+    print(chat.header(addon.name):append(chat.message('Addon update detected (' .. oldVer .. ' -> v' .. addon.version .. '). Backing up profiles...')));
+    profileManager.BackupCurrentProfiles(addon.version);
+    -- Reload global profiles to ensure version is updated in memory
+    globalProfiles = profileManager.GetGlobalProfiles();
 end
 
--- Migrate party list layout settings (convert old settings to layout-specific format)
-if not gConfig.partyListLayout1 then
-	-- User has old settings format, migrate to Layout 1
-	gConfig.partyListLayout1 = T{
-		-- Migrate main party settings
-		partyListScaleX = gConfig.partyListScaleX or 1,
-		partyListScaleY = gConfig.partyListScaleY or 1,
-		partyListFontSize = gConfig.partyListFontSize or 16,
-		partyListJobIconScale = gConfig.partyListJobIconScale or 1,
-		partyListEntrySpacing = gConfig.partyListEntrySpacing or 0,
-		partyListTP = (gConfig.partyListTP ~= nil) and gConfig.partyListTP or true,
-		partyListMinRows = gConfig.partyListMinRows or 1,
+-- ==========================================================
+-- = LOAD PROFILE SETTINGS =
+-- ==========================================================
 
-		-- Migrate alliance party 2 settings
-		partyList2ScaleX = gConfig.partyList2ScaleX or 0.7,
-		partyList2ScaleY = gConfig.partyList2ScaleY or 0.7,
-		partyList2FontSize = gConfig.partyList2FontSize or 16,
-		partyList2JobIconScale = gConfig.partyList2JobIconScale or 0.8,
-		partyList2EntrySpacing = gConfig.partyList2EntrySpacing or 6,
-		partyList2TP = (gConfig.partyList2TP ~= nil) and gConfig.partyList2TP or false,
+-- Load character settings (tracks which profile is active)
+local charSettings = settings.load({ currentProfile = 'Default' });
+config = charSettings; -- Keep reference to character config
 
-		-- Migrate alliance party 3 settings
-		partyList3ScaleX = gConfig.partyList3ScaleX or 0.7,
-		partyList3ScaleY = gConfig.partyList3ScaleY or 0.7,
-		partyList3FontSize = gConfig.partyList3FontSize or 16,
-		partyList3JobIconScale = gConfig.partyList3JobIconScale or 0.8,
-		partyList3EntrySpacing = gConfig.partyList3EntrySpacing or 6,
-		partyList3TP = (gConfig.partyList3TP ~= nil) and gConfig.partyList3TP or false,
+-- Global profiles list
+local globalProfiles = profileManager.GetGlobalProfiles();
 
-		-- Use default bar dimensions and text offsets from default_settings
-		hpBarWidth = 150,
-		mpBarWidth = 100,
-		tpBarWidth = 100,
-		barHeight = 20,
-		barSpacing = 8,
-
-		nameTextOffsetX = 1,
-		nameTextOffsetY = 0,
-		hpTextOffsetX = -2,
-		hpTextOffsetY = -1,
-		mpTextOffsetX = -2,
-		mpTextOffsetY = -1,
-		tpTextOffsetX = -2,
-		tpTextOffsetY = -1,
-	};
-
-	-- Remove old party-specific settings from top level (they're now in partyListLayout1)
-	gConfig.partyListScaleX = nil;
-	gConfig.partyListScaleY = nil;
-	gConfig.partyListFontSize = nil;
-	gConfig.partyListJobIconScale = nil;
-	gConfig.partyListEntrySpacing = nil;
-	gConfig.partyListTP = nil;
-	gConfig.partyListMinRows = nil;
-
-	gConfig.partyList2ScaleX = nil;
-	gConfig.partyList2ScaleY = nil;
-	gConfig.partyList2FontSize = nil;
-	gConfig.partyList2JobIconScale = nil;
-	gConfig.partyList2EntrySpacing = nil;
-	gConfig.partyList2TP = nil;
-
-	gConfig.partyList3ScaleX = nil;
-	gConfig.partyList3ScaleY = nil;
-	gConfig.partyList3FontSize = nil;
-	gConfig.partyList3JobIconScale = nil;
-	gConfig.partyList3EntrySpacing = nil;
-	gConfig.partyList3TP = nil;
+-- Ensure Default profile exists
+if (not profileManager.ProfileExists('Default')) then
+    profileManager.SaveProfileSettings('Default', deep_copy_table(defaultUserSettings));
 end
 
--- Initialize Layout 2 if missing (use defaults from defaultUserSettings)
-if not gConfig.partyListLayout2 then
-	gConfig.partyListLayout2 = deep_copy_table(defaultUserSettings.partyListLayout2);
+-- Load active profile
+local currentProfileName = charSettings.currentProfile;
+if (not profileManager.ProfileExists(currentProfileName)) then
+    currentProfileName = 'Default';
+    charSettings.currentProfile = 'Default';
+    settings.save();
 end
 
--- Ensure partyListLayout selector exists (default to Layout 1)
-if gConfig.partyListLayout == nil then
-	gConfig.partyListLayout = 0;
+gConfig = profileManager.GetProfileSettings(currentProfileName);
+if (gConfig == nil) then
+    gConfig = deep_copy_table(defaultUserSettings);
 end
 
--- Migrate to new per-party settings structure (partyA, partyB, partyC)
-if not gConfig.partyA then
-	-- Migrate from old settings to new per-party structure
-	local oldLayout = (gConfig.partyListLayout == 1) and gConfig.partyListLayout2 or gConfig.partyListLayout1;
+gConfig.appliedPositions = {};
+gConfigVersion = 0;
+settingsMigration.RunStructureMigrations(gConfig, defaultUserSettings);
 
-	-- Helper to safely get old value or default
-	local function getOld(key, default)
-		if oldLayout and oldLayout[key] ~= nil then return oldLayout[key]; end
-		if gConfig[key] ~= nil then return gConfig[key]; end
-		return default;
-	end
+-- Show migration message
 
-	gConfig.partyA = T{
-		layout = gConfig.partyListLayout or 0,
-		showDistance = gConfig.showPartyListDistance or false,
-		distanceHighlight = gConfig.partyListDistanceHighlight or 0,
-		showJobIcon = gConfig.showPartyJobIcon ~= false,
-		showJob = gConfig.showPartyListJob ~= false,
-		showCastBars = gConfig.partyListCastBars ~= false,
-		castBarScaleY = gConfig.partyListCastBarScaleY or 0.6,
-		showBookends = gConfig.showPartyListBookends ~= false,
-		showTitle = gConfig.showPartyListTitle ~= false,
-		flashTP = gConfig.partyListFlashTP or false,
-		showTP = getOld('partyListTP', true),
-		backgroundName = gConfig.partyListBackgroundName or 'Window1',
-		bgScale = gConfig.partyListBgScale or 1.0,
-		cursor = gConfig.partyListCursor or 'GreyArrow.png',
-		subtargetArrowTint = 0xFFfdd017,
-		targetArrowTint = 0xFFFFFFFF,
-		statusTheme = gConfig.partyListStatusTheme or 0,
-		buffScale = gConfig.partyListBuffScale or 1.0,
-		expandHeight = gConfig.partyListExpandHeight or false,
-		alignBottom = gConfig.partyListAlignBottom or false,
-		minRows = getOld('partyListMinRows', 1),
-		entrySpacing = getOld('partyListEntrySpacing', 0),
-		selectionBoxScaleY = getOld('selectionBoxScaleY', 1),
-		scaleX = getOld('partyListScaleX', 1),
-		scaleY = getOld('partyListScaleY', 1),
-		fontSize = getOld('partyListFontSize', 12),
-		splitFontSizes = getOld('splitFontSizes', false),
-		nameFontSize = getOld('partyListNameFontSize', 12),
-		hpFontSize = getOld('partyListHpFontSize', 12),
-		mpFontSize = getOld('partyListMpFontSize', 12),
-		tpFontSize = getOld('partyListTpFontSize', 12),
-		distanceFontSize = getOld('partyListDistanceFontSize', 12),
-		jobFontSize = getOld('partyListJobFontSize', 12),
-		jobIconScale = getOld('partyListJobIconScale', 1),
-		hpBarScaleX = getOld('hpBarScaleX', 1),
-		mpBarScaleX = getOld('mpBarScaleX', 1),
-		tpBarScaleX = getOld('tpBarScaleX', 1),
-		hpBarScaleY = getOld('hpBarScaleY', 1),
-		mpBarScaleY = getOld('mpBarScaleY', 1),
-		tpBarScaleY = getOld('tpBarScaleY', 1),
-	};
 
-	gConfig.partyB = T{
-		layout = gConfig.partyListLayout or 0,
-		showDistance = gConfig.showPartyListDistance or false,
-		distanceHighlight = gConfig.partyListDistanceHighlight or 0,
-		showJobIcon = gConfig.showPartyJobIcon ~= false,
-		showJob = gConfig.showPartyListJob ~= false,
-		showCastBars = gConfig.partyListCastBars ~= false,
-		castBarScaleY = gConfig.partyListCastBarScaleY or 0.6,
-		showBookends = gConfig.showPartyListBookends ~= false,
-		showTitle = gConfig.showPartyListTitle ~= false,
-		flashTP = gConfig.partyListFlashTP or false,
-		showTP = getOld('partyList2TP', false),
-		backgroundName = gConfig.partyListBackgroundName or 'Window1',
-		bgScale = gConfig.partyListBgScale or 1.0,
-		cursor = gConfig.partyListCursor or 'GreyArrow.png',
-		subtargetArrowTint = 0xFFfdd017,
-		targetArrowTint = 0xFFFFFFFF,
-		statusTheme = gConfig.partyListStatusTheme or 0,
-		buffScale = gConfig.partyListBuffScale or 1.0,
-		expandHeight = gConfig.partyListExpandHeight or false,
-		alignBottom = gConfig.partyListAlignBottom or false,
-		minRows = 1,
-		entrySpacing = getOld('partyList2EntrySpacing', 6),
-		selectionBoxScaleY = 1,
-		scaleX = getOld('partyList2ScaleX', 0.7),
-		scaleY = getOld('partyList2ScaleY', 0.7),
-		fontSize = getOld('partyList2FontSize', 12),
-		splitFontSizes = getOld('splitFontSizes', false),
-		nameFontSize = getOld('partyList2NameFontSize', 12),
-		hpFontSize = getOld('partyList2HpFontSize', 12),
-		mpFontSize = getOld('partyList2MpFontSize', 12),
-		tpFontSize = getOld('partyList2TpFontSize', 12),
-		distanceFontSize = getOld('partyList2DistanceFontSize', 12),
-		jobFontSize = getOld('partyList2JobFontSize', 12),
-		jobIconScale = getOld('partyList2JobIconScale', 0.8),
-		hpBarScaleX = getOld('partyList2HpBarScaleX', 0.9),
-		mpBarScaleX = getOld('partyList2MpBarScaleX', 0.6),
-		tpBarScaleX = getOld('partyList2TpBarScaleX', 1),
-		hpBarScaleY = getOld('partyList2HpBarScaleY', 1),
-		mpBarScaleY = getOld('partyList2MpBarScaleY', 0.7),
-		tpBarScaleY = getOld('partyList2TpBarScaleY', 1),
-	};
+-- State variables
+showConfig = { false };
+local pendingVisualUpdate = false;
+local pendingProfileChange = nil;
+local pendingProfileDeletion = nil;
+bLoggedIn = gameState.CheckLoggedIn();
+local bInitialized = false;
+local wasInParty = false;  -- Tracks party state for detecting party leave
 
-	gConfig.partyC = T{
-		layout = gConfig.partyListLayout or 0,
-		showDistance = gConfig.showPartyListDistance or false,
-		distanceHighlight = gConfig.partyListDistanceHighlight or 0,
-		showJobIcon = gConfig.showPartyJobIcon ~= false,
-		showJob = gConfig.showPartyListJob ~= false,
-		showCastBars = gConfig.partyListCastBars ~= false,
-		castBarScaleY = gConfig.partyListCastBarScaleY or 0.6,
-		showBookends = gConfig.showPartyListBookends ~= false,
-		showTitle = gConfig.showPartyListTitle ~= false,
-		flashTP = gConfig.partyListFlashTP or false,
-		showTP = getOld('partyList3TP', false),
-		backgroundName = gConfig.partyListBackgroundName or 'Window1',
-		bgScale = gConfig.partyListBgScale or 1.0,
-		cursor = gConfig.partyListCursor or 'GreyArrow.png',
-		subtargetArrowTint = 0xFFfdd017,
-		targetArrowTint = 0xFFFFFFFF,
-		statusTheme = gConfig.partyListStatusTheme or 0,
-		buffScale = gConfig.partyListBuffScale or 1.0,
-		expandHeight = gConfig.partyListExpandHeight or false,
-		alignBottom = gConfig.partyListAlignBottom or false,
-		minRows = 1,
-		entrySpacing = getOld('partyList3EntrySpacing', 6),
-		selectionBoxScaleY = 1,
-		scaleX = getOld('partyList3ScaleX', 0.7),
-		scaleY = getOld('partyList3ScaleY', 0.7),
-		fontSize = getOld('partyList3FontSize', 12),
-		splitFontSizes = getOld('splitFontSizes', false),
-		nameFontSize = getOld('partyList3NameFontSize', 12),
-		hpFontSize = getOld('partyList3HpFontSize', 12),
-		mpFontSize = getOld('partyList3MpFontSize', 12),
-		tpFontSize = getOld('partyList3TpFontSize', 12),
-		distanceFontSize = getOld('partyList3DistanceFontSize', 12),
-		jobFontSize = getOld('partyList3JobFontSize', 12),
-		jobIconScale = getOld('partyList3JobIconScale', 0.8),
-		hpBarScaleX = getOld('partyList3HpBarScaleX', 0.9),
-		mpBarScaleX = getOld('partyList3MpBarScaleX', 0.6),
-		tpBarScaleX = getOld('partyList3TpBarScaleX', 1),
-		hpBarScaleY = getOld('partyList3HpBarScaleY', 1),
-		mpBarScaleY = getOld('partyList3MpBarScaleY', 0.7),
-		tpBarScaleY = getOld('partyList3TpBarScaleY', 1),
-	};
-
-	-- Initialize layout templates if missing
-	if not gConfig.layoutHorizontal then
-		gConfig.layoutHorizontal = deep_copy_table(defaultUserSettings.layoutHorizontal);
-	end
-	if not gConfig.layoutCompact then
-		gConfig.layoutCompact = deep_copy_table(defaultUserSettings.layoutCompact);
-	end
-end
-
--- Migrate old partyList colors to per-party color settings (partyListA, partyListB, partyListC)
-if gConfig.colorCustomization and gConfig.colorCustomization.partyList and not gConfig.colorCustomization.partyListA then
-	-- Copy old partyList colors to all three party color configs
-	gConfig.colorCustomization.partyListA = deep_copy_table(gConfig.colorCustomization.partyList);
-	gConfig.colorCustomization.partyListB = deep_copy_table(gConfig.colorCustomization.partyList);
-	gConfig.colorCustomization.partyListC = deep_copy_table(gConfig.colorCustomization.partyList);
-
-	-- Remove TP-related colors from Party B and C (alliance members don't have TP)
-	gConfig.colorCustomization.partyListB.tpGradient = nil;
-	gConfig.colorCustomization.partyListB.tpEmptyTextColor = nil;
-	gConfig.colorCustomization.partyListB.tpFullTextColor = nil;
-	gConfig.colorCustomization.partyListB.castBarGradient = nil;
-	gConfig.colorCustomization.partyListC.tpGradient = nil;
-	gConfig.colorCustomization.partyListC.tpEmptyTextColor = nil;
-	gConfig.colorCustomization.partyListC.tpFullTextColor = nil;
-	gConfig.colorCustomization.partyListC.castBarGradient = nil;
-
-	-- Remove old partyList (now deprecated)
-	gConfig.colorCustomization.partyList = nil;
-end
-
--- Initialize per-party color settings if missing (for fresh installs after migration code)
-if gConfig.colorCustomization then
-	if not gConfig.colorCustomization.partyListA then
-		gConfig.colorCustomization.partyListA = deep_copy_table(defaultUserSettings.colorCustomization.partyListA);
-	end
-	if not gConfig.colorCustomization.partyListB then
-		gConfig.colorCustomization.partyListB = deep_copy_table(defaultUserSettings.colorCustomization.partyListB);
-	end
-	if not gConfig.colorCustomization.partyListC then
-		gConfig.colorCustomization.partyListC = deep_copy_table(defaultUserSettings.colorCustomization.partyListC);
-	end
+-- Check if player is currently in a party (has other members)
+local function IsInParty()
+    local party = AshitaCore:GetMemoryManager():GetParty();
+    if party == nil then return false; end
+    -- Check if any other party members (slots 1-5) are active
+    for i = 1, 5 do
+        if party:GetMemberIsActive(i) == 1 then
+            return true;
+        end
+    end
+    return false;
 end
 
 -- Helper function to get party settings by index (1=A, 2=B, 3=C)
 function GetPartySettings(partyIndex)
-	if partyIndex == 3 then return gConfig.partyC;
-	elseif partyIndex == 2 then return gConfig.partyB;
-	else return gConfig.partyA;
-	end
+    if partyIndex == 3 then return gConfig.partyC;
+    elseif partyIndex == 2 then return gConfig.partyB;
+    else return gConfig.partyA;
+    end
 end
 
 -- Helper function to get layout template for a party
 function GetLayoutTemplate(partyIndex)
-	local party = GetPartySettings(partyIndex);
-	if party.layout == 1 then
-		return gConfig.layoutCompact;
-	else
-		return gConfig.layoutHorizontal;
-	end
+    local party = GetPartySettings(partyIndex);
+    return party.layout == 1 and gConfig.layoutCompact or gConfig.layoutHorizontal;
 end
 
-showConfig = { false };
-local pendingVisualUpdate = false;
+local function GetDefaultWindowPositions()
+    local defPos = require('libs.defaultpositions');
+    local px, py = defPos.GetPlayerBarPosition();
+    local tx, ty = defPos.GetTargetBarPosition();
+    local pl1x, pl1y = defPos.GetPartyListPosition();
+    local pl2x, pl2y = defPos.GetPartyList2Position();
+    local pl3x, pl3y = defPos.GetPartyList3Position();
+    local cx, cy = defPos.GetCastBarPosition();
+    local nx, ny = defPos.GetNotificationsPosition();
+    local tpx, tpy = defPos.GetTreasurePoolPosition();
+    local petx, pety = defPos.GetPetBarPosition();
+    local ex, ey = defPos.GetExpBarPosition();
+    local gx, gy = defPos.GetGilTrackerPosition();
+    local ix, iy = defPos.GetInventoryPosition();
+
+    return {
+        PlayerBar = { x = px, y = py },
+        TargetBar = { x = tx, y = ty },
+        PartyList = { x = pl1x, y = pl1y },
+        PartyList2 = { x = pl2x, y = pl2y },
+        PartyList3 = { x = pl3x, y = pl3y },
+        CastBar = { x = cx, y = cy },
+        Notifications_Group1 = { x = nx, y = ny },
+        Notifications_Group2 = { x = nx, y = ny + 180 },
+        TreasurePool = { x = tpx, y = tpy },
+        PetBar = { x = petx, y = pety },
+        ExpBar = { x = ex, y = ey },
+        GilTracker = { x = gx, y = gy },
+        InventoryTracker = { x = ix, y = iy },
+    };
+end
+
+function CreateProfile(name)
+    if (profileManager.ProfileExists(name)) then return false; end
+    
+    local newSettings = deep_copy_table(defaultUserSettings);
+    newSettings.windowPositions = GetDefaultWindowPositions();
+    profileManager.SaveProfileSettings(name, newSettings);
+    
+    local globalProfiles = profileManager.GetGlobalProfiles();
+    table.insert(globalProfiles.names, name);
+    table.insert(globalProfiles.order, name);
+    profileManager.SaveGlobalProfiles(globalProfiles);
+    
+    RequestProfileChange(name);
+    return true;
+end
+
+function DuplicateProfile(name)
+    local baseName = name;
+    -- If duplicating Default, we might want to name it "Profile (1)" or just "Default (1)"
+    
+    local counter = 1;
+    local newName = baseName .. " (" .. counter .. ")";
+    
+    while (profileManager.ProfileExists(newName)) do
+        counter = counter + 1;
+        newName = baseName .. " (" .. counter .. ")";
+    end
+    
+    local currentSettings = profileManager.GetProfileSettings(name);
+    if (currentSettings == nil) then return false; end
+    
+    local newSettings = deep_copy_table(currentSettings);
+    profileManager.SaveProfileSettings(newName, newSettings);
+    
+    local globalProfiles = profileManager.GetGlobalProfiles();
+    table.insert(globalProfiles.names, newName);
+    table.insert(globalProfiles.order, newName);
+    profileManager.SaveGlobalProfiles(globalProfiles);
+    
+    RequestProfileChange(newName);
+    return true;
+end
+
+
+
+function ChangeProfile(name)
+    if (not profileManager.ProfileExists(name)) then return false; end
+
+    -- Always save current profile before switching (positions, etc.)
+    profileManager.SaveProfileSettings(config.currentProfile, gConfig);
+
+    config.currentProfile = name;
+    settings.save(); -- Save character preference
+
+    -- Clear textures to prevent ghosting
+    TextureManager.clear();
+
+    uiModules.HideAll();
+
+    gConfig = profileManager.GetProfileSettings(name);
+    gConfig.appliedPositions = {}; -- Ensure we re-apply positions for the new profile
+
+    -- If profile has no saved positions, inject defaults
+    if (not gConfig.windowPositions or next(gConfig.windowPositions) == nil) then
+        gConfig.windowPositions = GetDefaultWindowPositions();
+    end
+
+    settingsMigration.RunStructureMigrations(gConfig, defaultUserSettings);
+    UpdateSettings();
+    return true;
+end
+
+-- Defer profile change to next frame to avoid destroying D3D resources during ImGui render
+function RequestProfileChange(name)
+    pendingProfileChange = name;
+    return true;
+end
+
+function GetProfileNames()
+    local globalProfiles = profileManager.GetGlobalProfiles();
+    local profiles = {};
+    for _, name in ipairs(globalProfiles.order) do
+        table.insert(profiles, name);
+    end
+    table.sort(profiles);
+    return profiles;
+end
+
+function GetCurrentProfileName()
+    return config.currentProfile;
+end
 
 function ResetSettings()
-	local patchNotesVer = gConfig.patchNotesVer;
-	gConfig = deep_copy_table(defaultUserSettings);
-	gConfig.patchNotesVer = patchNotesVer;
-	config.userSettings = gConfig; -- Update the config reference so settings.save() saves the new values
-	UpdateSettings();
-	settings.save(); -- Save the reset settings to disk
+    gConfig = deep_copy_table(defaultUserSettings);
+    gConfig.windowPositions = GetDefaultWindowPositions();
+    gConfig.appliedPositions = {};
+    profileManager.SaveProfileSettings(config.currentProfile, gConfig);
+    UpdateSettings();
+    bInternalSave = true;
+    settings.save();
+    bInternalSave = false;
+
+    -- Reset all module positions to defaults
+    uiMods.playerbar.ResetPositions();
+    uiMods.targetbar.ResetPositions();
+    uiMods.castbar.ResetPositions();
+    uiMods.enemylist.ResetPositions();
+    uiMods.expbar.ResetPositions();
+    uiMods.giltracker.ResetPositions();
+    uiMods.partylist.ResetPositions();
+    uiMods.inventory.ResetPositions();
+    uiMods.castcost.ResetPositions();
+    uiMods.petbar.ResetPositions();
+    uiMods.notifications.ResetPositions();
+    uiMods.treasurepool.ResetPositions();
+    hotbar.ResetPositions();
 end
 
--- Helper function to save a party list layout-specific setting
 function SavePartyListLayoutSetting(key, value)
-	local currentLayout = (gConfig.partyListLayout == 1) and gConfig.partyListLayout2 or gConfig.partyListLayout1;
-	currentLayout[key] = value;
+    local currentLayout = (gConfig.partyListLayout == 1) and gConfig.partyListLayout2 or gConfig.partyListLayout1;
+    currentLayout[key] = value;
 end
 
 function CheckVisibility()
-	if (gConfig.showPlayerBar == false) then
-		playerBar.SetHidden(true);
-	end
-	if (gConfig.showExpBar == false) then
-		expBar.SetHidden(true);
-	end
-	if (gConfig.showGilTracker == false) then
-		gilTracker.SetHidden(true);
-	end
-	if (gConfig.showInventoryTracker == false) then
-		inventoryTracker.SetHidden(true);
-	end
-	if (gConfig.showSatchelTracker == false) then
-		satchelTracker.SetHidden(true);
-	end
-	if (gConfig.showPartyList == false) then
-		partyList.SetHidden(true);
-	end
-	if (gConfig.showCastBar == false) then
-		castBar.SetHidden(true);
-	end
-	if (gConfig.showTargetBar == false) then
-		targetBar.SetHidden(true);
-	end
-end
-
-local function ForceHide()
-
-	playerBar.SetHidden(true);
-	targetBar.SetHidden(true);
-	expBar.SetHidden(true);
-	gilTracker.SetHidden(true);
-	inventoryTracker.SetHidden(true);
-	satchelTracker.SetHidden(true);
-	partyList.SetHidden(true);
-	castBar.SetHidden(true);
-end
-
-local function UpdateVisuals()
-	playerBar.UpdateVisuals(gAdjustedSettings.playerBarSettings);
-	targetBar.UpdateVisuals(gAdjustedSettings.targetBarSettings);
-	expBar.UpdateVisuals(gAdjustedSettings.expBarSettings);
-	gilTracker.UpdateVisuals(gAdjustedSettings.gilTrackerSettings);
-	inventoryTracker.UpdateVisuals(gAdjustedSettings.inventoryTrackerSettings);
-	satchelTracker.UpdateVisuals(gAdjustedSettings.satchelTrackerSettings);
-	partyList.UpdateVisuals(gAdjustedSettings.partyListSettings);
-	castBar.UpdateVisuals(gAdjustedSettings.castBarSettings);
-	enemyList.UpdateVisuals(gAdjustedSettings.enemyListSettings);
+    uiModules.CheckVisibility(gConfig);
 end
 
 function UpdateUserSettings()
-    local ds = default_settings;
-	local us = gConfig;
-
-	-- Apply global font family, weight, and outline width to all font settings
-	local fontWeightFlags = GetFontWeightFlags(us.fontWeight);
-
-	-- Target Bar
-	gAdjustedSettings.targetBarSettings.name_font_settings.font_family = us.fontFamily;
-	gAdjustedSettings.targetBarSettings.name_font_settings.font_flags = fontWeightFlags;
-	gAdjustedSettings.targetBarSettings.name_font_settings.outline_width = us.fontOutlineWidth;
-	gAdjustedSettings.targetBarSettings.totName_font_settings.font_family = us.fontFamily;
-	gAdjustedSettings.targetBarSettings.totName_font_settings.font_flags = fontWeightFlags;
-	gAdjustedSettings.targetBarSettings.totName_font_settings.outline_width = us.fontOutlineWidth;
-	gAdjustedSettings.targetBarSettings.distance_font_settings.font_family = us.fontFamily;
-	gAdjustedSettings.targetBarSettings.distance_font_settings.font_flags = fontWeightFlags;
-	gAdjustedSettings.targetBarSettings.distance_font_settings.outline_width = us.fontOutlineWidth;
-	gAdjustedSettings.targetBarSettings.percent_font_settings.font_family = us.fontFamily;
-	gAdjustedSettings.targetBarSettings.percent_font_settings.font_flags = fontWeightFlags;
-	gAdjustedSettings.targetBarSettings.percent_font_settings.outline_width = us.fontOutlineWidth;
-	gAdjustedSettings.targetBarSettings.cast_font_settings.font_family = us.fontFamily;
-	gAdjustedSettings.targetBarSettings.cast_font_settings.font_flags = fontWeightFlags;
-	gAdjustedSettings.targetBarSettings.cast_font_settings.outline_width = us.fontOutlineWidth;
-
-	-- Player Bar
-	gAdjustedSettings.playerBarSettings.font_settings.font_family = us.fontFamily;
-	gAdjustedSettings.playerBarSettings.font_settings.font_flags = fontWeightFlags;
-	gAdjustedSettings.playerBarSettings.font_settings.outline_width = us.fontOutlineWidth;
-
-	-- Exp Bar
-	gAdjustedSettings.expBarSettings.job_font_settings.font_family = us.fontFamily;
-	gAdjustedSettings.expBarSettings.job_font_settings.font_flags = fontWeightFlags;
-	gAdjustedSettings.expBarSettings.job_font_settings.outline_width = us.fontOutlineWidth;
-	gAdjustedSettings.expBarSettings.exp_font_settings.font_family = us.fontFamily;
-	gAdjustedSettings.expBarSettings.exp_font_settings.font_flags = fontWeightFlags;
-	gAdjustedSettings.expBarSettings.exp_font_settings.outline_width = us.fontOutlineWidth;
-	gAdjustedSettings.expBarSettings.percent_font_settings.font_family = us.fontFamily;
-	gAdjustedSettings.expBarSettings.percent_font_settings.font_flags = fontWeightFlags;
-	gAdjustedSettings.expBarSettings.percent_font_settings.outline_width = us.fontOutlineWidth;
-
-	-- Gil Tracker
-	gAdjustedSettings.gilTrackerSettings.font_settings.font_family = us.fontFamily;
-	gAdjustedSettings.gilTrackerSettings.font_settings.font_flags = fontWeightFlags;
-	gAdjustedSettings.gilTrackerSettings.font_settings.outline_width = us.fontOutlineWidth;
-
-	-- Inventory Tracker
-	gAdjustedSettings.inventoryTrackerSettings.font_settings.font_family = us.fontFamily;
-	gAdjustedSettings.inventoryTrackerSettings.font_settings.font_flags = fontWeightFlags;
-	gAdjustedSettings.inventoryTrackerSettings.font_settings.outline_width = us.fontOutlineWidth;
-
-	-- Satchel Tracker
-	gAdjustedSettings.satchelTrackerSettings.font_settings.font_family = us.fontFamily;
-	gAdjustedSettings.satchelTrackerSettings.font_settings.font_flags = fontWeightFlags;
-	gAdjustedSettings.satchelTrackerSettings.font_settings.outline_width = us.fontOutlineWidth;
-
-	-- Party List
-	gAdjustedSettings.partyListSettings.hp_font_settings.font_family = us.fontFamily;
-	gAdjustedSettings.partyListSettings.hp_font_settings.font_flags = fontWeightFlags;
-	gAdjustedSettings.partyListSettings.hp_font_settings.outline_width = us.fontOutlineWidth;
-	gAdjustedSettings.partyListSettings.mp_font_settings.font_family = us.fontFamily;
-	gAdjustedSettings.partyListSettings.mp_font_settings.font_flags = fontWeightFlags;
-	gAdjustedSettings.partyListSettings.mp_font_settings.outline_width = us.fontOutlineWidth;
-	gAdjustedSettings.partyListSettings.tp_font_settings.font_family = us.fontFamily;
-	gAdjustedSettings.partyListSettings.tp_font_settings.font_flags = fontWeightFlags;
-	gAdjustedSettings.partyListSettings.tp_font_settings.outline_width = us.fontOutlineWidth;
-	gAdjustedSettings.partyListSettings.name_font_settings.font_family = us.fontFamily;
-	gAdjustedSettings.partyListSettings.name_font_settings.font_flags = fontWeightFlags;
-	gAdjustedSettings.partyListSettings.name_font_settings.outline_width = us.fontOutlineWidth;
-	gAdjustedSettings.partyListSettings.title_font_settings.font_family = us.fontFamily;
-	gAdjustedSettings.partyListSettings.title_font_settings.font_flags = bit.bor(fontWeightFlags, gdi.FontFlags.Italic);
-	gAdjustedSettings.partyListSettings.title_font_settings.outline_width = us.fontOutlineWidth;
-
-	-- Cast Bar
-	gAdjustedSettings.castBarSettings.spell_font_settings.font_family = us.fontFamily;
-	gAdjustedSettings.castBarSettings.spell_font_settings.font_flags = fontWeightFlags;
-	gAdjustedSettings.castBarSettings.spell_font_settings.outline_width = us.fontOutlineWidth;
-	gAdjustedSettings.castBarSettings.percent_font_settings.font_family = us.fontFamily;
-	gAdjustedSettings.castBarSettings.percent_font_settings.font_flags = fontWeightFlags;
-	gAdjustedSettings.castBarSettings.percent_font_settings.outline_width = us.fontOutlineWidth;
-
-	-- Enemy List
-	gAdjustedSettings.enemyListSettings.name_font_settings.font_family = us.fontFamily;
-	gAdjustedSettings.enemyListSettings.name_font_settings.font_flags = fontWeightFlags;
-	gAdjustedSettings.enemyListSettings.name_font_settings.outline_width = us.fontOutlineWidth;
-	gAdjustedSettings.enemyListSettings.distance_font_settings.font_family = us.fontFamily;
-	gAdjustedSettings.enemyListSettings.distance_font_settings.font_flags = fontWeightFlags;
-	gAdjustedSettings.enemyListSettings.distance_font_settings.outline_width = us.fontOutlineWidth;
-	gAdjustedSettings.enemyListSettings.percent_font_settings.font_family = us.fontFamily;
-	gAdjustedSettings.enemyListSettings.percent_font_settings.font_flags = fontWeightFlags;
-	gAdjustedSettings.enemyListSettings.percent_font_settings.outline_width = us.fontOutlineWidth;
-
-	-- Target Bar
-	gAdjustedSettings.targetBarSettings.barWidth = ds.targetBarSettings.barWidth * us.targetBarScaleX;
-	gAdjustedSettings.targetBarSettings.barHeight = ds.targetBarSettings.barHeight * us.targetBarScaleY;
-	gAdjustedSettings.targetBarSettings.totBarHeight = ds.targetBarSettings.totBarHeight * us.targetBarScaleY;
-	gAdjustedSettings.targetBarSettings.name_font_settings.font_height = math.max(us.targetBarNameFontSize, 8);
-	-- Note: name_font_settings.color is set dynamically by GetColorOfTarget() based on entity type
-    gAdjustedSettings.targetBarSettings.totName_font_settings.font_height = math.max(us.targetBarNameFontSize, 8);
-	gAdjustedSettings.targetBarSettings.distance_font_settings.font_height = math.max(us.targetBarDistanceFontSize, 8);
-    gAdjustedSettings.targetBarSettings.percent_font_settings.font_height = math.max(us.targetBarPercentFontSize, 8);
-	gAdjustedSettings.targetBarSettings.cast_font_settings.font_height = math.max(us.targetBarCastFontSize, 8);
-	gAdjustedSettings.targetBarSettings.iconSize = ds.targetBarSettings.iconSize * us.targetBarIconScale;
-	gAdjustedSettings.targetBarSettings.arrowSize = ds.targetBarSettings.arrowSize * us.targetBarScaleY;
-	-- Buff/Debuff positioning
-	gAdjustedSettings.targetBarSettings.buffsOffsetY = us.targetBarBuffsOffsetY;
-	-- Cast bar positioning and scaling (use adjusted barWidth, not default)
-	gAdjustedSettings.targetBarSettings.castBarOffsetY = us.targetBarCastBarOffsetY;
-	gAdjustedSettings.targetBarSettings.castBarOffsetX = ds.targetBarSettings.castBarOffsetX; -- Fixed offset from default settings
-	gAdjustedSettings.targetBarSettings.castBarWidth = (gAdjustedSettings.targetBarSettings.barWidth - (ds.targetBarSettings.castBarOffsetX * 2)) * us.targetBarCastBarScaleX;
-	gAdjustedSettings.targetBarSettings.castBarHeight = 8 * us.targetBarCastBarScaleY;
-
-	-- Target of Target Bar (separate scaling when split is enabled)
-	gAdjustedSettings.targetBarSettings.totBarWidth = (ds.targetBarSettings.barWidth / 3) * us.totBarScaleX;
-	gAdjustedSettings.targetBarSettings.totBarHeightSplit = ds.targetBarSettings.totBarHeight * us.totBarScaleY;
-	gAdjustedSettings.targetBarSettings.totName_font_settings_split = {
-		visible = ds.targetBarSettings.totName_font_settings.visible,
-		locked = ds.targetBarSettings.totName_font_settings.locked,
-		font_family = us.fontFamily,
-		font_height = math.max(us.totBarFontSize, 8),
-		color = us.colorCustomization.totBar.nameTextColor,
-		bold = ds.targetBarSettings.totName_font_settings.bold,
-		color_outline = ds.targetBarSettings.totName_font_settings.color_outline,
-		draw_flags = ds.targetBarSettings.totName_font_settings.draw_flags,
-		background = ds.targetBarSettings.totName_font_settings.background,
-		right_justified = ds.targetBarSettings.totName_font_settings.right_justified,
-	};
-
-	-- Party List (load settings from new per-party structure)
-	-- Helper function to get font size hash for change detection
-	local function getFontSizeHash(party)
-		local nameSize = party.nameFontSize or 12;
-		local hpSize = party.hpFontSize or 12;
-		local mpSize = party.mpFontSize or 12;
-		local tpSize = party.tpFontSize or 12;
-		local distSize = party.distanceFontSize or 12;
-		local jobSize = party.jobFontSize or 12;
-		return nameSize + (hpSize * 100) + (mpSize * 10000) + (tpSize * 1000000) + (distSize * 100000000) + (jobSize * 10000000000);
-	end
-
-	-- Store per-party settings in gAdjustedSettings for partylist.lua to access
-	gAdjustedSettings.partyListSettings.partySettings = {
-		[1] = us.partyA,
-		[2] = us.partyB,
-		[3] = us.partyC,
-	};
-
-	-- Store layout templates
-	gAdjustedSettings.partyListSettings.layoutTemplates = {
-		[0] = us.layoutHorizontal,
-		[1] = us.layoutCompact,
-	};
-
-    gAdjustedSettings.partyListSettings.baseIconSize = ds.partyListSettings.iconSize;  -- Base icon size for job icons
-
-	-- Apply font sizes for each party (hash used for change detection)
-	gAdjustedSettings.partyListSettings.fontSizes = {
-		us.partyA.splitFontSizes and getFontSizeHash(us.partyA) or (us.partyA.fontSize or 12),
-		us.partyB.splitFontSizes and getFontSizeHash(us.partyB) or (us.partyB.fontSize or 12),
-		us.partyC.splitFontSizes and getFontSizeHash(us.partyC) or (us.partyC.fontSize or 12),
-	};
-
-	gAdjustedSettings.partyListSettings.title_font_settings.font_height = math.max(us.partyListTitleFontSize, 8);
-
-	gAdjustedSettings.partyListSettings.entrySpacing = {
-        ds.partyListSettings.entrySpacing + (us.partyA.entrySpacing or 0),
-        ds.partyListSettings.entrySpacing + (us.partyB.entrySpacing or 0),
-        ds.partyListSettings.entrySpacing + (us.partyC.entrySpacing or 0),
-    };
-
-	-- Note: Bar dimensions and text offsets are now per-party via layoutTemplates
-	-- These are kept for backwards compatibility but will be read per-party in partylist.lua
-	local layoutA = us.partyA.layout == 1 and us.layoutCompact or us.layoutHorizontal;
-	gAdjustedSettings.partyListSettings.hpBarWidth = layoutA.hpBarWidth or 150;
-	gAdjustedSettings.partyListSettings.mpBarWidth = layoutA.mpBarWidth or 100;
-	gAdjustedSettings.partyListSettings.tpBarWidth = layoutA.tpBarWidth or 100;
-	gAdjustedSettings.partyListSettings.barHeight = layoutA.barHeight or 20;
-	gAdjustedSettings.partyListSettings.barSpacing = layoutA.barSpacing or 8;
-	gAdjustedSettings.partyListSettings.hpBarScaleX = us.partyA.hpBarScaleX or 1;
-	gAdjustedSettings.partyListSettings.mpBarScaleX = us.partyA.mpBarScaleX or 1;
-	gAdjustedSettings.partyListSettings.hpBarScaleY = us.partyA.hpBarScaleY or 1;
-	gAdjustedSettings.partyListSettings.mpBarScaleY = us.partyA.mpBarScaleY or 1;
-
-	gAdjustedSettings.partyListSettings.nameTextOffsetX = layoutA.nameTextOffsetX or 1;
-	gAdjustedSettings.partyListSettings.nameTextOffsetY = layoutA.nameTextOffsetY or 0;
-	gAdjustedSettings.partyListSettings.hpTextOffsetX = layoutA.hpTextOffsetX or -2;
-	gAdjustedSettings.partyListSettings.hpTextOffsetY = layoutA.hpTextOffsetY or -1;
-	gAdjustedSettings.partyListSettings.mpTextOffsetX = layoutA.mpTextOffsetX or -2;
-	gAdjustedSettings.partyListSettings.mpTextOffsetY = layoutA.mpTextOffsetY or -1;
-	gAdjustedSettings.partyListSettings.tpTextOffsetX = layoutA.tpTextOffsetX or -2;
-	gAdjustedSettings.partyListSettings.tpTextOffsetY = layoutA.tpTextOffsetY or -1;
-
-	-- Legacy compatibility - these are still used by some code paths
-	gAdjustedSettings.partyListSettings.iconSize = ds.partyListSettings.iconSize * (us.partyA.buffScale or 1);
-	gAdjustedSettings.partyListSettings.expandHeight = us.partyA.expandHeight or false;
-	gAdjustedSettings.partyListSettings.alignBottom = us.partyA.alignBottom or false;
-	gAdjustedSettings.partyListSettings.minRows = us.partyA.minRows or 1;
-
-	-- Note: All party list text colors are set dynamically in partylist.DrawWindow every frame
-
-	-- Player Bar
-	gAdjustedSettings.playerBarSettings.barWidth = ds.playerBarSettings.barWidth * us.playerBarScaleX;
-	gAdjustedSettings.playerBarSettings.barSpacing = ds.playerBarSettings.barSpacing * us.playerBarScaleX;
-	gAdjustedSettings.playerBarSettings.barHeight = ds.playerBarSettings.barHeight * us.playerBarScaleY;
-	gAdjustedSettings.playerBarSettings.font_settings.font_height = math.max(us.playerBarFontSize, 8);
-	-- Note: HP, MP, TP text colors are set dynamically in playerbar.DrawWindow
-
-	-- Exp Bar
-	gAdjustedSettings.expBarSettings.barWidth = ds.expBarSettings.barWidth * us.expBarScaleX;
-	gAdjustedSettings.expBarSettings.barHeight = ds.expBarSettings.barHeight * us.expBarScaleY;
-	gAdjustedSettings.expBarSettings.job_font_settings.font_height = math.max(us.expBarFontSize, 8);
-	gAdjustedSettings.expBarSettings.exp_font_settings.font_height = math.max(us.expBarFontSize, 8);
-	gAdjustedSettings.expBarSettings.percent_font_settings.font_height = math.max(us.expBarFontSize, 8);
-
-	-- Gil Tracker
-	gAdjustedSettings.gilTrackerSettings.iconScale = ds.gilTrackerSettings.iconScale * us.gilTrackerScale;
-	gAdjustedSettings.gilTrackerSettings.font_settings.font_height = math.max(us.gilTrackerFontSize, 8);
-	-- Set font alignment based on text position (right align = text on right = left-aligned font)
-	gAdjustedSettings.gilTrackerSettings.font_settings.font_alignment = us.gilTrackerRightAlign and gdi.Alignment.Left or gdi.Alignment.Right;
-	-- Pass through the alignment setting
-	gAdjustedSettings.gilTrackerSettings.rightAlign = us.gilTrackerRightAlign;
-	
-	-- Inventory Tracker
-	gAdjustedSettings.inventoryTrackerSettings.dotRadius = ds.inventoryTrackerSettings.dotRadius * us.inventoryTrackerScale;
-	gAdjustedSettings.inventoryTrackerSettings.dotSpacing = ds.inventoryTrackerSettings.dotSpacing * us.inventoryTrackerScale;
-	gAdjustedSettings.inventoryTrackerSettings.groupSpacing = ds.inventoryTrackerSettings.groupSpacing * us.inventoryTrackerScale;
-	gAdjustedSettings.inventoryTrackerSettings.font_settings.font_height = math.max(us.inventoryTrackerFontSize, 8);
-    gAdjustedSettings.inventoryTrackerSettings.columnCount = us.inventoryTrackerColumnCount;
-    gAdjustedSettings.inventoryTrackerSettings.rowCount = us.inventoryTrackerRowCount;
-    gAdjustedSettings.inventoryTrackerSettings.showText = us.inventoryShowCount;
-
-	-- Satchel Tracker
-	gAdjustedSettings.satchelTrackerSettings.dotRadius = ds.satchelTrackerSettings.dotRadius * us.satchelTrackerScale;
-	gAdjustedSettings.satchelTrackerSettings.dotSpacing = ds.satchelTrackerSettings.dotSpacing * us.satchelTrackerScale;
-	gAdjustedSettings.satchelTrackerSettings.groupSpacing = ds.satchelTrackerSettings.groupSpacing * us.satchelTrackerScale;
-	gAdjustedSettings.satchelTrackerSettings.font_settings.font_height = math.max(us.satchelTrackerFontSize, 8);
-    gAdjustedSettings.satchelTrackerSettings.columnCount = us.satchelTrackerColumnCount;
-    gAdjustedSettings.satchelTrackerSettings.rowCount = us.satchelTrackerRowCount;
-    gAdjustedSettings.satchelTrackerSettings.showText = us.satchelShowCount;
-
-	-- Enemy List
-	gAdjustedSettings.enemyListSettings.barWidth = ds.enemyListSettings.barWidth * us.enemyListScaleX;
-	gAdjustedSettings.enemyListSettings.barHeight = ds.enemyListSettings.barHeight * us.enemyListScaleY;
-	gAdjustedSettings.enemyListSettings.iconSize = ds.enemyListSettings.iconSize * us.enemyListIconScale;
-	gAdjustedSettings.enemyListSettings.debuffOffsetX = us.enemyListDebuffOffsetX;
-	gAdjustedSettings.enemyListSettings.debuffOffsetY = us.enemyListDebuffOffsetY;
-	gAdjustedSettings.enemyListSettings.name_font_settings.font_height = math.max(us.enemyListNameFontSize, 8);
-	gAdjustedSettings.enemyListSettings.distance_font_settings.font_height = math.max(us.enemyListDistanceFontSize, 8);
-	gAdjustedSettings.enemyListSettings.percent_font_settings.font_height = math.max(us.enemyListPercentFontSize, 8);
-
-	-- Cast Bar
-	gAdjustedSettings.castBarSettings.barWidth = ds.castBarSettings.barWidth * us.castBarScaleX;
-	gAdjustedSettings.castBarSettings.barHeight = ds.castBarSettings.barHeight * us.castBarScaleY;
-	gAdjustedSettings.castBarSettings.spell_font_settings.font_height = math.max(us.castBarFontSize, 8);
-	gAdjustedSettings.castBarSettings.percent_font_settings.font_height = math.max(us.castBarFontSize, 8);
+    gConfigVersion = gConfigVersion + 1; -- Notify caches of settings change (for real-time slider updates)
+    settingsUpdater.UpdateUserSettings(gAdjustedSettings, settingsDefaults.default_settings, gConfig);
 end
 
--- Just save settings to disk (no updates)
 function SaveSettingsToDisk()
-    -- Ensure colorCustomization exists with defaults for existing users
     if gConfig.colorCustomization == nil then
         gConfig.colorCustomization = deep_copy_table(defaultUserSettings.colorCustomization);
     end
+    gConfigVersion = gConfigVersion + 1; -- Notify caches of settings change
+    profileManager.SaveProfileSettings(config.currentProfile, gConfig);
+    bInternalSave = true;
     settings.save();
+    bInternalSave = false;
 end
 
--- Lightweight settings save that doesn't recreate fonts (for color changes, etc.)
 function SaveSettingsOnly()
-    -- Ensure colorCustomization exists with defaults for existing users
     if gConfig.colorCustomization == nil then
         gConfig.colorCustomization = deep_copy_table(defaultUserSettings.colorCustomization);
     end
-
-    -- Save the current settings to disk
+    gConfigVersion = gConfigVersion + 1; -- Notify caches of settings change
+    profileManager.SaveProfileSettings(config.currentProfile, gConfig);
+    bInternalSave = true;
     settings.save();
-
-    -- Update adjusted settings (scales, offsets, etc.)
+    bInternalSave = false;
     UpdateUserSettings();
 end
 
--- Module-specific visual asset updates (only update visuals for one module)
-function UpdatePlayerBarVisuals()
-	SaveSettingsOnly();
-	playerBar.UpdateVisuals(gAdjustedSettings.playerBarSettings);
-end
+-- New functions for profile management
 
-function UpdateTargetBarVisuals()
-	SaveSettingsOnly();
-	targetBar.UpdateVisuals(gAdjustedSettings.targetBarSettings);
-end
-
-function UpdatePartyListVisuals()
-	SaveSettingsOnly();
-	partyList.UpdateVisuals(gAdjustedSettings.partyListSettings);
-end
-
-function UpdateEnemyListVisuals()
-	SaveSettingsOnly();
-	enemyList.UpdateVisuals(gAdjustedSettings.enemyListSettings);
-end
-
-function UpdateExpBarVisuals()
-	SaveSettingsOnly();
-	expBar.UpdateVisuals(gAdjustedSettings.expBarSettings);
-end
-
-function UpdateGilTrackerVisuals()
-	UpdateUserSettings();
-	gilTracker.UpdateVisuals(gAdjustedSettings.gilTrackerSettings);
-end
-
-function UpdateInventoryTrackerVisuals()
-	SaveSettingsOnly();
-	inventoryTracker.UpdateVisuals(gAdjustedSettings.inventoryTrackerSettings);
-end
-
-function UpdateSatchelTrackerVisuals()
-	SaveSettingsOnly();
-	satchelTracker.UpdateVisuals(gAdjustedSettings.satchelTrackerSettings);
-end
-
-function UpdateCastBarVisuals()
-	SaveSettingsOnly();
-	castBar.UpdateVisuals(gAdjustedSettings.castBarSettings);
-end
-
--- Full settings update including visual asset recreation (fonts, textures, etc.)
-function UpdateSettings()
-    SaveSettingsOnly();
-	CheckVisibility();
-	UpdateVisuals();
-end;
-
-function DeferredUpdateVisuals()
-	-- This schedules a visual asset update to happen outside the render loop
-	pendingVisualUpdate = true;
-end;
-
-settings.register('settings', 'settings_update', function (s)
-    if (s ~= nil) then
-        config = s;
-		gConfig = config.userSettings;
-		UpdateSettings();
-    end
-end);
-
--- Get if we are logged in right when the addon loads
-bLoggedIn = false;
-local playerIndex = AshitaCore:GetMemoryManager():GetParty():GetMemberTargetIndex(0);
-if playerIndex ~= 0 then
-    local entity = AshitaCore:GetMemoryManager():GetEntity();
-    local flags = entity:GetRenderFlags0(playerIndex);
-    if (bit.band(flags, RENDER_FLAG_VISIBLE) == RENDER_FLAG_VISIBLE) and (bit.band(flags, RENDER_FLAG_HIDDEN) == 0) then
-        bLoggedIn = true;
-	end
-end
-
--- Track initialization state to prevent rendering before font objects are created
-local bInitialized = false;
-
---Thanks to Velyn for the event system and interface hidden signatures!
-local pGameMenu = ashita.memory.find('FFXiMain.dll', 0, "8B480C85C974??8B510885D274??3B05", 16, 0);
-local pEventSystem = ashita.memory.find('FFXiMain.dll', 0, "A0????????84C0741AA1????????85C0741166A1????????663B05????????0F94C0C3", 0, 0);
-local pInterfaceHidden = ashita.memory.find('FFXiMain.dll', 0, "8B4424046A016A0050B9????????E8????????F6D81BC040C3", 0, 0);
-
-local function GetMenuName()
-    local subPointer = ashita.memory.read_uint32(pGameMenu);
-    local subValue = ashita.memory.read_uint32(subPointer);
-    if (subValue == 0) then
-        return '';
-    end
-    local menuHeader = ashita.memory.read_uint32(subValue + 4);
-    local menuName = ashita.memory.read_string(menuHeader + 0x46, 16);
-    return string.gsub(menuName, '\x00', '');
-end
-
-local function GetEventSystemActive()
-    if (pEventSystem == 0) then
-        return false;
-    end
-    local ptr = ashita.memory.read_uint32(pEventSystem + 1);
-    if (ptr == 0) then
-        return false;
-    end
-
-    return (ashita.memory.read_uint8(ptr) == 1);
-
-end
-
-local function GetInterfaceHidden()
-    if (pEventSystem == 0) then
-        return false;
-    end
-    local ptr = ashita.memory.read_uint32(pInterfaceHidden + 10);
-    if (ptr == 0) then
-        return false;
-    end
-
-    return (ashita.memory.read_uint8(ptr + 0xB4) == 1);
-end
-
-function GetHidden()
-
-	if (gConfig.hideDuringEvents and GetEventSystemActive()) then
-    	return true;
-    end
-
-	if (string.match(GetMenuName(), 'map')) then
-		return true;
-	end
-
-    if (GetInterfaceHidden()) then
-        return true;
-    end
-
-	if (bLoggedIn == false) then
-		return true;
-	end
+function RenameProfile(oldName, newName)
+    if (oldName == 'Default') then return false; end
+    if (profileManager.ProfileExists(newName)) then return false; end
+    if (not profileManager.ProfileExists(oldName)) then return false; end
     
+    local settingsData = profileManager.GetProfileSettings(oldName);
+    profileManager.SaveProfileSettings(newName, settingsData);
+    profileManager.DeleteProfile(oldName);
+    
+    local globalProfiles = profileManager.GetGlobalProfiles();
+    
+    -- Update names list
+    for i, name in ipairs(globalProfiles.names) do
+        if name == oldName then
+            globalProfiles.names[i] = newName;
+            break;
+        end
+    end
+    
+    -- Update order list
+    for i, name in ipairs(globalProfiles.order) do
+        if name == oldName then
+            globalProfiles.order[i] = newName;
+            break;
+        end
+    end
+    
+    profileManager.SaveGlobalProfiles(globalProfiles);
+    
+    if (config.currentProfile == oldName) then
+        config.currentProfile = newName;
+        settings.save();
+    end
+    
+    return true;
+end
+
+function DeleteProfile(name)
+    if (name == 'Default') then return false; end
+    
+    -- If deleting the active profile, switch to Default first
+    if (config.currentProfile == name) then
+        if (not RequestProfileChange('Default')) then
+            return false;
+        end
+        pendingProfileDeletion = name;
+    else
+        profileManager.DeleteProfile(name);
+    end
+    
+    local globalProfiles = profileManager.GetGlobalProfiles();
+    
+    -- Remove from names
+    for i, n in ipairs(globalProfiles.names) do
+        if n == name then
+            table.remove(globalProfiles.names, i);
+            break;
+        end
+    end
+    
+    -- Remove from order
+    for i, n in ipairs(globalProfiles.order) do
+        if n == name then
+            table.remove(globalProfiles.order, i);
+            break;
+        end
+    end
+    
+    profileManager.SaveGlobalProfiles(globalProfiles);
+    return true;
+end
+
+function MoveProfileUp(name)
+    local globalProfiles = profileManager.GetGlobalProfiles();
+    local order = globalProfiles.order;
+    
+    for i, n in ipairs(order) do
+        if n == name then
+            if i > 1 then
+                order[i], order[i-1] = order[i-1], order[i];
+                profileManager.SaveGlobalProfiles(globalProfiles);
+                return true;
+            end
+            break;
+        end
+    end
     return false;
 end
 
+function MoveProfileDown(name)
+    local globalProfiles = profileManager.GetGlobalProfiles();
+    local order = globalProfiles.order;
+    
+    for i, n in ipairs(order) do
+        if n == name then
+            if i < #order then
+                order[i], order[i+1] = order[i+1], order[i];
+                profileManager.SaveGlobalProfiles(globalProfiles);
+                return true;
+            end
+            break;
+        end
+    end
+    return false;
+end
+
+-- Module-specific visual updaters (includes disk save - use for dropdowns, checkboxes)
+UpdatePlayerBarVisuals = uiModules.CreateVisualUpdater('playerBar', SaveSettingsOnly, gAdjustedSettings);
+UpdateTargetBarVisuals = uiModules.CreateVisualUpdater('targetBar', SaveSettingsOnly, gAdjustedSettings);
+UpdatePartyListVisuals = uiModules.CreateVisualUpdater('partyList', SaveSettingsOnly, gAdjustedSettings);
+UpdateEnemyListVisuals = uiModules.CreateVisualUpdater('enemyList', SaveSettingsOnly, gAdjustedSettings);
+UpdateExpBarVisuals = uiModules.CreateVisualUpdater('expBar', SaveSettingsOnly, gAdjustedSettings);
+UpdateInventoryTrackerVisuals = uiModules.CreateVisualUpdater('inventoryTracker', SaveSettingsOnly, gAdjustedSettings);
+UpdateCastBarVisuals = uiModules.CreateVisualUpdater('castBar', SaveSettingsOnly, gAdjustedSettings);
+UpdateCastCostVisuals = uiModules.CreateVisualUpdater('castCost', SaveSettingsOnly, gAdjustedSettings);
+
+function UpdateGilTrackerVisuals()
+    UpdateUserSettings();
+    gilTracker.UpdateVisuals(gAdjustedSettings.gilTrackerSettings);
+end
+
+function UpdateSettings()
+    SaveSettingsOnly();
+    CheckVisibility();
+    -- Clear cached colors to pick up new settings
+    InvalidateInterpolationColorCache();
+    InvalidateColorCaches();
+    uiModules.UpdateVisualsAll(gAdjustedSettings);
+end
+
+function DeferredUpdateVisuals()
+    pendingVisualUpdate = true;
+end
+
+settings.register('settings', 'settings_update', function (s)
+    -- Skip if this is an internal save (we already handle updates appropriately)
+    -- This callback is for external changes only (e.g., manual config file edits)
+    if bInternalSave then return; end
+    if (s ~= nil) then
+        config = s;
+
+        -- Validate profile existence
+        local currentProfileName = config.currentProfile;
+        if (not profileManager.ProfileExists(currentProfileName)) then
+            print(chat.header(addon.name):append(chat.message('Profile not found: ')):append(chat.error(currentProfileName)));
+            currentProfileName = 'Default';
+            config.currentProfile = 'Default';
+            settings.save();
+        end
+
+        -- Reload profile settings
+        local newGConfig = profileManager.GetProfileSettings(currentProfileName);
+        if (newGConfig) then
+            gConfig = newGConfig;
+        else
+            -- Fallback
+             gConfig = deep_copy_table(defaultUserSettings);
+        end
+        
+        -- Initialize runtime state
+        gConfig.appliedPositions = {};
+        
+        -- Run migrations
+        settingsMigration.RunStructureMigrations(gConfig, defaultUserSettings);
+        
+        -- Update visuals
+        UpdateSettings();
+        
+        print(chat.header(addon.name):append(chat.message('Loaded profile: ')):append(chat.success(currentProfileName)));
+    end
+end);
+
 --[[
-* event: d3d_present
-* desc : Event called when the Direct3D device is presenting a scene.
---]]
+* Event Handlers
+]]--
+
 ashita.events.register('d3d_present', 'present_cb', function ()
-	-- Prevent rendering before initialization completes
-	if not bInitialized then
-		return;
-	end
+    if not bInitialized then return; end
 
-	-- Process any pending visual asset updates (fonts, textures, etc.) outside the render loop
-	if pendingVisualUpdate then
-		pendingVisualUpdate = false;
-		statusHandler.clear_cache();  -- Clear texture cache before reloading
-		UpdateUserSettings();
-		UpdateVisuals();
-	end
+    -- Process pending profile change outside the render loop
+    if pendingProfileChange then
+        local name = pendingProfileChange;
+        pendingProfileChange = nil;
+        if ChangeProfile(name) then
+            if pendingProfileDeletion then
+                profileManager.DeleteProfile(pendingProfileDeletion);
+                pendingProfileDeletion = nil;
+            end
+        end
+    end
 
-    local eventSystemActive = GetEventSystemActive();
+    -- Process pending visual updates outside the render loop
+    if pendingVisualUpdate then
+        pendingVisualUpdate = false;
+        statusHandler.clear_cache();
+        UpdateUserSettings();
+        uiModules.UpdateVisualsAll(gAdjustedSettings);
+    end
 
-	if (GetHidden() == false) then
-		if (not gConfig.showPlayerBar or (gConfig.playerBarHideDuringEvents and eventSystemActive)) then
-            playerBar.SetHidden(true);
-        else
-			playerBar.DrawWindow(gAdjustedSettings.playerBarSettings);
-		end
-        if (not gConfig.showTargetBar or (gConfig.targetBarHideDuringEvents and eventSystemActive)) then
-            targetBar.SetHidden(true);
-        else
-			targetBar.DrawWindow(gAdjustedSettings.targetBarSettings);
-		end
-		if (not gConfig.showEnemyList) then
-			enemyList.SetHidden(true);
-		else
-			enemyList.DrawWindow(gAdjustedSettings.enemyListSettings);
-		end
-		if (gConfig.showExpBar) then
-			expBar.DrawWindow(gAdjustedSettings.expBarSettings);
-		end
-		if (gConfig.showGilTracker) then
-			gilTracker.DrawWindow(gAdjustedSettings.gilTrackerSettings);
-		end
-		if (gConfig.showInventoryTracker) then
-			inventoryTracker.DrawWindow(gAdjustedSettings.inventoryTrackerSettings);
-		end
-		if (gConfig.showSatchelTracker) then
-			satchelTracker.DrawWindow(gAdjustedSettings.satchelTrackerSettings);
-		end
-		if (not gConfig.showPartyList or (gConfig.partyListHideDuringEvents and eventSystemActive)) then
-            partyList.SetHidden(true);
-        else
-			partyList.DrawWindow(gAdjustedSettings.partyListSettings);
-		end
-		if (gConfig.showCastBar) then
-			castBar.DrawWindow(gAdjustedSettings.castBarSettings);
-		end
+    local eventSystemActive = gameState.GetEventSystemActive();
+    local menuOpen = gameState.GetMenuName() ~= '';
 
-		configMenu.DrawWindow();
+    if not gameState.ShouldHideUI(gConfig.hideDuringEvents, bLoggedIn) then
+        -- Sync treasure pool from memory (authoritative source of truth)
+        -- This ensures we never miss items, even if packets were dropped
+        if gConfig.showNotifications then
+            notifications.SyncTreasurePoolFromMemory();
+            -- Check pending pool items - creates "Treasure Pool" notification if item
+            -- hasn't been awarded (0x00D3) within 200ms of dropping (0x00D2)
+            notifications.CheckPendingPoolNotifications();
+        end
 
-		if (gConfig.patchNotesVer < gAdjustedSettings.currentPatchVer) then
-			patchNotes.DrawWindow();
-		end
-	else
-		ForceHide();
-	end
+        -- Render all registered modules
+        for name, _ in pairs(uiModules.GetAll()) do
+            uiModules.RenderModule(name, gConfig, gAdjustedSettings, eventSystemActive, menuOpen);
+        end
 
-	-- XIUI DEV ONLY
-	if _XIUI_DEV_HOT_RELOADING_ENABLED then
-		local currentTime = os.time();
+        configMenu.DrawWindow();
+    else
+        uiModules.HideAll();
+    end
 
-		if not _XIUI_DEV_HOT_RELOAD_LAST_RELOAD_TIME then
-			_XIUI_DEV_HOT_RELOAD_LAST_RELOAD_TIME = currentTime;
-		end
-
-		if _XIUI_DEV_HOT_RELOAD_LAST_RELOAD_TIME and currentTime - _XIUI_DEV_HOT_RELOAD_LAST_RELOAD_TIME > _XIUI_DEV_HOT_RELOAD_POLL_TIME_SECONDS then
-			_check_hot_reload();
-
-			_XIUI_DEV_HOT_RELOAD_LAST_RELOAD_TIME = currentTime;
-		end
-	end
+    -- XIUI DEV ONLY
+    if _XIUI_DEV_HOT_RELOADING_ENABLED then
+        local currentTime = os.time();
+        if not _XIUI_DEV_HOT_RELOAD_LAST_RELOAD_TIME then
+            _XIUI_DEV_HOT_RELOAD_LAST_RELOAD_TIME = currentTime;
+        end
+        if currentTime - _XIUI_DEV_HOT_RELOAD_LAST_RELOAD_TIME > _XIUI_DEV_HOT_RELOAD_POLL_TIME_SECONDS then
+            _check_hot_reload();
+            _XIUI_DEV_HOT_RELOAD_LAST_RELOAD_TIME = currentTime;
+        end
+    end
 end);
 
 ashita.events.register('load', 'load_cb', function ()
+    profileManager.SyncProfilesWithDisk();
+    gConfig.appliedPositions = {};
+    UpdateUserSettings();
+    uiModules.InitializeAll(gAdjustedSettings);
 
-	UpdateUserSettings();
-    playerBar.Initialize(gAdjustedSettings.playerBarSettings);
-	targetBar.Initialize(gAdjustedSettings.targetBarSettings);
-	expBar.Initialize(gAdjustedSettings.expBarSettings);
-	gilTracker.Initialize(gAdjustedSettings.gilTrackerSettings);
-	inventoryTracker.Initialize(gAdjustedSettings.inventoryTrackerSettings);
-	satchelTracker.Initialize(gAdjustedSettings.satchelTrackerSettings);
-	partyList.Initialize(gAdjustedSettings.partyListSettings);
-	castBar.Initialize(gAdjustedSettings.castBarSettings);
-	enemyList.Initialize(gAdjustedSettings.enemyListSettings);
+    -- Load mob data for current zone
+    local party = AshitaCore:GetMemoryManager():GetParty();
+    if party then
+        local currentZone = party:GetMemberZone(0);
+        if currentZone and currentZone > 0 then
+            mobInfo.data.LoadZone(currentZone);
+        end
+    end
 
-	-- Mark initialization as complete to allow rendering
-	bInitialized = true;
+    bInitialized = true;
 end);
 
 ashita.events.register('unload', 'unload_cb', function ()
-    -- Unregister all events
-    ashita.events.unregister('d3d_present', 'present_cb');
-    ashita.events.unregister('packet_in', 'packet_in_cb');
-    ashita.events.unregister('command', 'command_cb');
-
-    -- Cleanup module caches
     statusHandler.clear_cache();
+    progressbar.Cleanup();
+    TextureManager.clear();
+    if ClearDebuffFontCache then ClearDebuffFontCache(); end
 
-    -- Cleanup debuff font cache if function exists
-    if ClearDebuffFontCache then
-        ClearDebuffFontCache();
-    end
+    uiModules.CleanupAll();
 
-    -- Cleanup module font objects and primitives
-    if playerBar and playerBar.Cleanup then
-        playerBar.Cleanup();
-    end
-    if targetBar and targetBar.Cleanup then
-        targetBar.Cleanup();
-    end
-    if partyList and partyList.Cleanup then
-        partyList.Cleanup();
-    end
-    if enemyList and enemyList.Cleanup then
-        enemyList.Cleanup();
-    end
-    if castBar and castBar.Cleanup then
-        castBar.Cleanup();
-    end
-    if expBar and expBar.Cleanup then
-        expBar.Cleanup();
-    end
-    if gilTracker and gilTracker.Cleanup then
-        gilTracker.Cleanup();
-    end
-    if inventoryTracker and inventoryTracker.Cleanup then
-        inventoryTracker.Cleanup();
-    end
-	if satchelTracker and satchelTracker.Cleanup then
-        satchelTracker.Cleanup();
+    if mobInfo.data and mobInfo.data.Cleanup then
+        mobInfo.data.Cleanup();
     end
 
-    -- Cleanup GDI interface last
     gdi:destroy_interface();
 end);
 
 ashita.events.register('command', 'command_cb', function (e)
-   
-	-- Parse the command arguments
-	local command_args = e.command:lower():args()
+    local command_args = e.command:lower():args()
     if table.contains({'/xiui', '/hui', '/hxui', '/horizonxiui'}, command_args[1]) then
-		e.blocked = true;
+        e.blocked = true;
 
-        -- Toggle the config menu
         if (#command_args == 1) then
             showConfig[1] = not showConfig[1];
             return;
         end
 
-        -- Toggle the party list
         if (#command_args == 2 and command_args[2]:any('partylist')) then
             gConfig.showPartyList = not gConfig.showPartyList;
             CheckVisibility();
             return;
         end
 
-	end
+        -- Open macro palette: /xiui macro or /xiui macros
+        if (#command_args == 2 and command_args[2]:any('macro', 'macros')) then
+            macropalette.TogglePalette();
+            return;
+        end
 
+        -- Open keybind editor: /xiui keybinds or /xiui binds [bar]
+        if (#command_args >= 2 and command_args[2]:any('keybinds', 'keybind', 'binds', 'bind')) then
+            local hotbarConfig = require('config.hotbar');
+            local barIndex = tonumber(command_args[3]) or 1;
+            hotbarConfig.OpenKeybindEditor(barIndex);
+            return;
+        end
+
+        -- Lot all unlotted items: /xiui lotall or /xiui lot
+        if (#command_args == 2 and command_args[2]:any('lotall', 'lot')) then
+            treasurePool.LotAll();
+            return;
+        end
+
+        -- Pass all unlotted items: /xiui passall or /xiui pass
+        if (#command_args == 2 and command_args[2]:any('passall', 'pass')) then
+            treasurePool.PassAll();
+            return;
+        end
+
+        -- Toggle treasure pool window: /xiui tp
+        if (#command_args == 2 and command_args[2]:any('tp', 'treasurepool', 'pool')) then
+            treasurePool.ToggleForceShow();
+            return;
+        end
+
+        -- Test notification command: /xiui testnotif [type]
+        if (command_args[2] == 'testnotif') then
+            local testType = tonumber(command_args[3]) or 5;  -- default to ITEM_OBTAINED
+            notifications.TestNotification(testType, {
+                itemId = 4096,  -- Hi-Potion
+                itemName = 'Hi-Potion',
+                quantity = 1,
+                playerName = 'TestPlayer',
+                amount = 5000,
+            });
+            return;
+        end
+
+        -- Test treasure pool with 10 items: /xiui testpool10
+        if (command_args[2] == 'testpool10') then
+            notifications.TestTreasurePool10();
+            return;
+        end
+
+        -- Stress test treasure pool with 25 items: /xiui testpool25
+        if (command_args[2] == 'testpool25') then
+            notifications.TestTreasurePool25();
+            return;
+        end
+
+        -- Test pool only (no toasts) - for crash isolation: /xiui testpoolonly
+        if (command_args[2] == 'testpoolonly') then
+            notifications.TestPoolOnly();
+            return;
+        end
+
+        -- Test toasts only (no pool) - for crash isolation: /xiui testtoastsonly
+        if (command_args[2] == 'testtoastsonly') then
+            notifications.TestToastsOnly();
+            return;
+        end
+
+        -- Hotbar keybind execution: /xiui hotbar <bar> <slot>
+        -- Called by Ashita /bind system to execute hotbar actions
+        if (command_args[2] == 'hotbar' and #command_args >= 4) then
+            local barIndex = tonumber(command_args[3]);
+            local slotIndex = tonumber(command_args[4]);
+            if barIndex and slotIndex then
+                local hotbarActions = require('modules.hotbar.actions');
+                hotbarActions.HandleKeybind(barIndex, slotIndex);
+            end
+            return;
+        end
+
+        -- Palette commands: /xiui palette <name|next|prev> [bar|all]
+        -- Switch between named palettes for hotbars
+        -- Use "all" to affect all bars at once (like tHotBar behavior)
+        if (command_args[2] == 'palette' or command_args[2] == 'pal') then
+            local paletteModule = require('modules.hotbar.palette');
+            local hotbarData = require('modules.hotbar.data');
+            local jobId = hotbarData.jobId or 1;
+            local subjobId = hotbarData.subjobId or 0;
+
+            if #command_args < 3 then
+                -- No argument - show current palette info and help
+                print('[XIUI] Palette commands:');
+                print('  /xiui palette <name> - Switch to a named palette');
+                print('  /xiui palette next - Cycle to next palette');
+                print('  /xiui palette prev - Cycle to previous palette');
+                print('  /xiui palette list - List available palettes');
+                print('  /xiui palette first - Switch to first palette');
+                print('');
+                print('Keybinds: Ctrl+Up/Down (configure in Hotbar > Palette Cycling)');
+                print('Controller: RB + Dpad Up/Down cycles palettes');
+                return;
+            end
+
+            local action = command_args[3];
+            local barArg = command_args[4];
+            local affectAll = (barArg == 'all');
+            local barIndex = affectAll and 1 or (tonumber(barArg) or 1);
+
+            -- Helper to apply action to bar(s)
+            local function applyToBar(idx)
+                return paletteModule.CyclePalette(idx, action == 'next' and 1 or -1, jobId, subjobId);
+            end
+
+            if action == 'next' or action == 'prev' or action == 'previous' then
+                local direction = (action == 'next') and 1 or -1;
+                -- Global palette cycling - affects all bars at once
+                local result = paletteModule.CyclePalette(1, direction, jobId, subjobId);
+                if result then
+                    print('[XIUI] Palette: ' .. result);
+                else
+                    print('[XIUI] No palettes to cycle');
+                end
+            elseif action == 'list' then
+                -- List available palettes
+                local palettes = paletteModule.GetAvailablePalettes(barIndex, jobId, subjobId);
+                local currentPalette = paletteModule.GetActivePaletteDisplayName(barIndex);
+                print('[XIUI] Bar ' .. barIndex .. ' palettes:');
+                for _, name in ipairs(palettes) do
+                    local marker = (name == currentPalette) and ' *' or '';
+                    print('  - ' .. name .. marker);
+                end
+            elseif action == 'base' or action == 'reset' or action == 'first' then
+                -- Switch to first palette
+                local palettes = paletteModule.GetAvailablePalettes(1, jobId, subjobId);
+                if #palettes > 0 then
+                    paletteModule.SetActivePalette(1, palettes[1]);
+                    print('[XIUI] Palette: ' .. palettes[1]);
+                else
+                    print('[XIUI] No palettes available');
+                end
+            else
+                -- Switch to named palette
+                -- Reconstruct palette name in case it has spaces (use original case from command)
+                local originalArgs = e.command:args();
+                local paletteName = originalArgs[3];  -- Use original case
+                local targetIsAll = false;
+
+                if #originalArgs >= 4 then
+                    local lastArg = originalArgs[#originalArgs];
+                    if lastArg:lower() == 'all' then
+                        targetIsAll = true;
+                        -- Palette name is everything between arg 3 and "all"
+                        if #originalArgs > 4 then
+                            local nameParts = {};
+                            for i = 3, #originalArgs - 1 do
+                                table.insert(nameParts, originalArgs[i]);
+                            end
+                            paletteName = table.concat(nameParts, ' ');
+                        end
+                    elseif tonumber(lastArg) then
+                        barIndex = tonumber(lastArg);
+                        -- Palette name is everything between arg 3 and the bar number
+                        if #originalArgs > 4 then
+                            local nameParts = {};
+                            for i = 3, #originalArgs - 1 do
+                                table.insert(nameParts, originalArgs[i]);
+                            end
+                            paletteName = table.concat(nameParts, ' ');
+                        end
+                    else
+                        -- No bar number or "all", palette name is all remaining args
+                        local nameParts = {};
+                        for i = 3, #originalArgs do
+                            table.insert(nameParts, originalArgs[i]);
+                        end
+                        paletteName = table.concat(nameParts, ' ');
+                    end
+                end
+
+                if targetIsAll then
+                    -- Apply to all bars
+                    local anyFound = false;
+                    for i = 1, 6 do
+                        if paletteModule.PaletteExists(i, paletteName, jobId, subjobId) then
+                            paletteModule.SetActivePalette(i, paletteName);
+                            anyFound = true;
+                        end
+                    end
+                    if anyFound then
+                        print('[XIUI] All bars palette: ' .. paletteName);
+                    else
+                        print('[XIUI] Palette "' .. paletteName .. '" not found');
+                    end
+                else
+                    -- Apply to single bar
+                    if paletteModule.PaletteExists(barIndex, paletteName, jobId, subjobId) then
+                        paletteModule.SetActivePalette(barIndex, paletteName);
+                        print('[XIUI] Bar ' .. barIndex .. ' palette: ' .. paletteName);
+                    else
+                        print('[XIUI] Palette "' .. paletteName .. '" not found for bar ' .. barIndex);
+                    end
+                end
+            end
+            return;
+        end
+
+        -- Diagnostics commands: /xiui diag [on|off|stats|reset]
+        if (command_args[2] == 'diag') then
+            local subCmd = command_args[3] or 'stats';
+            if subCmd == 'on' or subCmd == 'enable' then
+                diagnostics.Enable();
+                print('[XIUI] Diagnostics enabled - resource tracking active');
+            elseif subCmd == 'off' or subCmd == 'disable' then
+                diagnostics.Disable();
+                print('[XIUI] Diagnostics disabled');
+            elseif subCmd == 'reset' then
+                diagnostics.ResetStats();
+                print('[XIUI] Diagnostics counters reset');
+            else
+                -- Default: print stats
+                diagnostics.PrintStats();
+            end
+            return;
+        end
+
+        -- Debug commands: /xiui debug <module>
+        -- Toggles debug logging for specific modules
+        if (command_args[2] == 'debug') then
+            local moduleName = command_args[3];
+            if moduleName == 'hotbar' then
+                -- Toggle hotbar debug mode
+                local currentState = hotbar.IsDebugEnabled();
+                hotbar.SetDebugEnabled(not currentState);
+            elseif moduleName == 'macroblock' then
+                -- Toggle macro block debug mode (both memory patches AND controller)
+                local macrosLib = require('libs.ffxi.macros');
+                local controller = require('modules.hotbar.controller');
+                local currentState = macrosLib.is_debug_enabled();
+                local newState = not currentState;
+                macrosLib.set_debug_enabled(newState);
+                controller.SetMacroBlockDebugEnabled(newState);
+            elseif moduleName == 'rawinput' then
+                -- Toggle raw input debug (logs ALL controller events from Ashita)
+                DEBUG_RAW_INPUT = not DEBUG_RAW_INPUT;
+                print('[XIUI] Raw input debug: ' .. (DEBUG_RAW_INPUT and 'ON' or 'OFF'));
+                print('[XIUI] This logs ALL xinput/dinput events from Ashita before any processing.');
+            elseif moduleName == 'palette' then
+                -- Toggle palette key debug mode (logs Ctrl+Up/Down key events)
+                local currentState = hotbar.IsPaletteDebugEnabled();
+                hotbar.SetPaletteDebugEnabled(not currentState);
+            else
+                print('[XIUI] Debug modules: hotbar, macroblock, rawinput, palette');
+                print('[XIUI] Usage: /xiui debug <module>');
+            end
+            return;
+        end
+
+        -- Reset gil tracking: /xiui gil reset (or legacy: /xiui resetgil)
+        if (command_args[2] == 'gil' and command_args[3] == 'reset') or (command_args[2] == 'resetgil') then
+            gilTracker.ResetTracking();
+            return;
+        end
+
+        -- ============================================
+        -- Profile Commands
+        -- ============================================
+
+        if (command_args[2] == 'profile') then
+            -- /xiui profile reset
+            if (command_args[3] == 'reset') then
+                 configMenu.OpenResetSettingsPopup();
+                 return;
+            end
+            
+            -- /xiui profile next
+            if (command_args[3] == 'next') then
+                local profiles = GetProfileNames();
+                local current = GetCurrentProfileName();
+                local index = 0;
+                for i, name in ipairs(profiles) do
+                    if name == current then index = i; break; end
+                end
+                if index > 0 then
+                    local nextIndex = (index % #profiles) + 1;
+                    ChangeProfile(profiles[nextIndex]);
+                    print(chat.header(addon.name):append(chat.message('Switched to profile: ')):append(chat.success(profiles[nextIndex])));
+                end
+                return;
+            end
+
+            -- /xiui profile previous
+            if (command_args[3] == 'previous') then
+                local profiles = GetProfileNames();
+                local current = GetCurrentProfileName();
+                local index = 0;
+                for i, name in ipairs(profiles) do
+                    if name == current then index = i; break; end
+                end
+                if index > 0 then
+                    local prevIndex = (index - 2 + #profiles) % #profiles + 1;
+                    ChangeProfile(profiles[prevIndex]);
+                    print(chat.header(addon.name):append(chat.message('Switched to profile: ')):append(chat.success(profiles[prevIndex])));
+                end
+                return;
+            end
+
+            -- /xiui profile sync
+            if (command_args[3] == 'sync') then
+                profileManager.SyncProfilesWithDisk();
+                return;
+            end
+
+            -- /xiui profile "name" (switch to profile)
+            -- This catches anything else as a profile name
+            if (command_args[3] ~= nil) then
+                local profileName = command_args[3];
+                if (ChangeProfile(profileName)) then
+                     print(chat.header(addon.name):append(chat.message('Switched to profile: ')):append(chat.success(profileName)));
+                else
+                     print(chat.header(addon.name):append(chat.message('Profile not found: ')):append(chat.error(profileName)));
+                end
+                return;
+            end
+        end
+
+        -- ============================================
+        -- Cache Debug Commands
+        -- ============================================
+
+        -- Show progressbar cache statistics: /xiui cachestats
+        if (command_args[2] == 'cachestats') then
+            progressbar.PrintCacheStats();
+            return;
+        end
+
+        -- Show texture cache statistics: /xiui texturestats
+        if (command_args[2] == 'texturestats') then
+            TextureManager.printStats();
+            return;
+        end
+
+        -- Clear texture cache: /xiui textureclear
+        if (command_args[2] == 'textureclear') then
+            TextureManager.clear();
+            print(chat.header(addon.name):append(chat.message('TextureManager cache cleared')));
+            return;
+        end
+
+        -- Clear all caches: /xiui clearcache
+        if (command_args[2] == 'clearcache') then
+            progressbar.ForceClearCache();
+            TextureManager.clear();
+            statusHandler.clear_cache();
+            print(chat.header(addon.name):append(chat.message('All texture caches cleared')));
+            return;
+        end
+
+        -- Skillchain debug: /xiui scdebug
+        if (command_args[2] == 'scdebug') then
+            skillchainModule.DebugDumpState();
+            return;
+        end
+
+        -- Stress test gradient cache: /xiui stresscache [count]
+        if (command_args[2] == 'stresscache') then
+            local count = tonumber(command_args[3]) or 100;
+            progressbar.StressTestCache(count);
+            return;
+        end
+
+        -- Stress test texture manager: /xiui stresstextures [count]
+        if (command_args[2] == 'stresstextures') then
+            local count = tonumber(command_args[3]) or 150;
+            print(chat.header(addon.name):append(chat.message(string.format('Stress testing TextureManager with %d status icons...', count))));
+            local statsBefore = TextureManager.getStats();
+            local beforeEvictions = statsBefore.categories.status_icons.evictions;
+
+            -- Request many status icons (valid IDs are 0-640)
+            for i = 0, count - 1 do
+                TextureManager.getStatusIcon(i, nil);
+            end
+
+            local statsAfter = TextureManager.getStats();
+            local afterEvictions = statsAfter.categories.status_icons.evictions;
+            local newEvictions = afterEvictions - beforeEvictions;
+
+            print(chat.header(addon.name):append(chat.message(string.format('Created %d status icons, %d evictions triggered',
+                statsAfter.categories.status_icons.size, newEvictions))));
+            TextureManager.printStats();
+            return;
+        end
+
+        -- Force garbage collection: /xiui gc
+        if (command_args[2] == 'gc') then
+            local before = collectgarbage('count');
+            collectgarbage('collect');
+            local after = collectgarbage('count');
+            print(chat.header(addon.name):append(chat.message('Garbage collection: ')):append(chat.success(string.format('%.1f KB -> %.1f KB (freed %.1f KB)',
+                before, after, before - after))));
+            return;
+        end
+    end
 end);
 
--- Track our packets
 ashita.events.register('packet_in', 'packet_in_cb', function (e)
     expBar.HandlePacket(e)
 
-	if (e.id == 0x0028) then
-		local actionPacket = ParseActionPacket(e);
+    -- Pet bar packet handling (0x0028 Action, 0x0068 Pet Sync)
+    if gConfig.showPetBar then
+        petBar.HandlePacket(e);
+    end
 
-		if actionPacket then
-			if (gConfig.showEnemyList) then
-				enemyList.HandleActionPacket(actionPacket);
-			end
+    -- Hotbar pet palette sync (0x0068 Pet Sync)
+    if e.id == 0x0068 and gConfig.hotbarEnabled then
+        hotbar.HandlePetSyncPacket();
+    end
 
-			if (gConfig.showCastBar) then
-				castBar.HandleActionPacket(actionPacket);
-			end
+    if (e.id == 0x0028) then
+        local actionPacket = ParseActionPacket(e);
+        if actionPacket then
+            if gConfig.showEnemyList then enemyList.HandleActionPacket(actionPacket); end
+            if gConfig.showCastBar then castBar.HandleActionPacket(actionPacket); end
+            if gConfig.showTargetBar and gConfig.showTargetBarCastBar and not HzLimitedMode then
+                targetBar.HandleActionPacket(actionPacket);
+            end
+            if gConfig.showPartyList then partyList.HandleActionPacket(actionPacket); end
+            debuffHandler.HandleActionPacket(actionPacket);
+            actionTracker.HandleActionPacket(actionPacket);
+            if gConfig.showNotifications then notifications.HandleActionPacket(actionPacket); end
+            -- Skillchain tracking for hotbar/crossbar WS highlighting
+            if gConfig.hotbarEnabled then
+                skillchainModule.HandleActionPacket(actionPacket);
+            end
+        end
+    elseif (e.id == 0x00E) then
+        local mobUpdatePacket = ParseMobUpdatePacket(e);
+        if gConfig.showEnemyList then enemyList.HandleMobUpdatePacket(mobUpdatePacket); end
+    elseif (e.id == 0x00A) then
+        -- Note: We do NOT clear treasure pool on zone - items persist across zones
+        -- The server will send 0x00D2 packets to sync pool state after zoning
+        notifications.HandleZonePacket();
+        treasurePool.HandleZonePacket();
+        enemyList.HandleZonePacket(e);
+        partyList.HandleZonePacket(e);
+        debuffHandler.HandleZonePacket(e);
+        actionTracker.HandleZonePacket();
+        mobInfo.data.HandleZonePacket(e);
+        statusHandler.clear_zone_cache();  -- Clear status icon cache to prevent accumulation
+        gilTracker.HandleZoneInPacket();  -- Only reset on fresh login, not zone changes (issue #111)
+        TextureManager.clearOnZone();
+        MarkPartyCacheDirty();
+        ClearEntityCache();
+        bLoggedIn = true;
+        -- Initialize hotbar job on zone-in (handles initial login and job change during zone)
+        if gConfig.hotbarEnabled then
+            hotbar.HandleJobChangePacket(e);
+        end
+    elseif (e.id == 0x0029) then
+        local messagePacket = ParseMessagePacket(e.data);
+        if messagePacket then
+            debuffHandler.HandleMessagePacket(messagePacket);
+            if gConfig.showNotifications then
+                notifications.HandleMessagePacket(e, messagePacket, 0x0029);
+            end
+        end
+    elseif (e.id == 0x002D) then
+        -- Kill message packet (item/gil rewards from defeating mobs)
+        -- Same structure as 0x0029, used for post-combat notifications
+        local messagePacket = ParseMessagePacket(e.data);
+        if messagePacket then
+            if gConfig.showNotifications then
+                notifications.HandleMessagePacket(e, messagePacket, 0x002D);
+            end
+        end
+    elseif (e.id == 0x002A) then
+        -- Message Standard packet (zone/container messages)
+        -- Different structure than 0x0029 - use ParseMessageStandardPacket
+        local messagePacket = ParseMessageStandardPacket(e.data);
+        if messagePacket then
+            if gConfig.showNotifications then
+                notifications.HandleMessagePacket(e, messagePacket, 0x002A);
+            end
+        end
+    elseif (e.id == 0x00B) then
+        notifications.HandleZonePacket();
+        treasurePool.HandleZonePacket();
+        gilTracker.HandleZoneOutPacket();  -- Track zone-out time for login detection (issue #111)
+        TextureManager.clearOnZone();
+        bLoggedIn = false;
+        -- Also notify hotbar of zone (clears state)
+        if gConfig.hotbarEnabled then
+            hotbar.HandleZonePacket();
+            skillchainModule.ClearState();  -- Clear skillchain tracking on zone
+        end
+    elseif (e.id == 0x001B) then
+        -- Job change packet - update hotbar to show new job's actions
+        if gConfig.hotbarEnabled then
+            hotbar.HandleJobChangePacket(e);
+        end
+    elseif (e.id == 0x076) then
+        statusHandler.ReadPartyBuffsFromPacket(e);
+    elseif (e.id == 0x0DD) then
+        MarkPartyCacheDirty();
+        -- Detect party leave and clear treasure pool
+        local currentlyInParty = IsInParty();
+        if wasInParty and not currentlyInParty then
+            -- Player left party - clear treasure pool (forfeited)
+            notifications.ClearTreasurePool();
+        end
+        wasInParty = currentlyInParty;
+    elseif (e.id == 0x00DC) then
+        -- Party invite packet
+        if gConfig.showNotifications and gConfig.notificationsShowPartyInvite then
+            notifications.HandlePartyInvite(e);
+        end
+    elseif (e.id == 0x0021) then
+        -- Trade request packet
+        if gConfig.showNotifications and gConfig.notificationsShowTradeInvite then
+            notifications.HandleTradeRequest(e);
+        end
+    elseif (e.id == 0x0022) then
+        -- Trade response packet (cancel, complete, error, etc.)
+        if gConfig.showNotifications then
+            notifications.HandleTradeResponse(e);
+        end
+    elseif (e.id == 0x0020) then
+        -- Inventory item update packet (item added to inventory)
+        if gConfig.showNotifications and gConfig.notificationsShowItems then
+            notifications.HandleInventoryUpdate(e);
+        end
+    elseif (e.id == 0x00D2) then
+        -- Treasure pool update packet (item dropped to pool)
+        if gConfig.showNotifications and gConfig.notificationsShowTreasure then
+            notifications.HandleTreasurePool(e);
+        end
+    elseif (e.id == 0x00D3) then
+        -- Treasure lot/drop packet (party member lotted or item awarded)
+        -- Parse packet for treasure pool lot tracking (always, not just for notifications)
+        local winnerServerId = struct.unpack('I4', e.data, 0x04 + 1);
+        local entryServerId = struct.unpack('I4', e.data, 0x08 + 1);
+        local winnerLot = struct.unpack('H', e.data, 0x0E + 1);
+        local entryActIndexAndFlag = struct.unpack('H', e.data, 0x10 + 1);
+        local entryFlg = bit.band(bit.rshift(entryActIndexAndFlag, 15), 1);
+        local entryLot = struct.unpack('h', e.data, 0x12 + 1);  -- signed
+        local slot = struct.unpack('B', e.data, 0x14 + 1);
+        local judgeFlg = struct.unpack('B', e.data, 0x15 + 1);
+        -- Extract names (16-byte null-terminated strings)
+        local winnerNameRaw = struct.unpack('c16', e.data, 0x16 + 1);
+        local entryNameRaw = struct.unpack('c16', e.data, 0x26 + 1);
+        local winnerName = winnerNameRaw and winnerNameRaw:match('^[^%z]+') or '';
+        local entryName = entryNameRaw and entryNameRaw:match('^[^%z]+') or '';
 
-			if (gConfig.showTargetBar and gConfig.showTargetBarCastBar and (not HzLimitedMode)) then
-				targetBar.HandleActionPacket(actionPacket);
-			end
+        -- Route to treasure pool module for lot history tracking
+        if gConfig.treasurePoolEnabled then
+            treasurePool.HandleLotPacket(slot, entryServerId, entryName, entryFlg, entryLot,
+                                         winnerServerId, winnerName, winnerLot, judgeFlg);
+        end
 
-			if (gConfig.showPartyList) then
-				partyList.HandleActionPacket(actionPacket);
-			end
-
-			debuffHandler.HandleActionPacket(actionPacket);
-			actionTracker.HandleActionPacket(actionPacket);
-		end
-	elseif (e.id == 0x00E) then
-		local mobUpdatePacket = ParseMobUpdatePacket(e);
-		if (gConfig.showEnemyList) then
-			enemyList.HandleMobUpdatePacket(mobUpdatePacket);
-		end
-	elseif (e.id == 0x00A) then
-		enemyList.HandleZonePacket(e);
-		partyList.HandleZonePacket(e);
-		debuffHandler.HandleZonePacket(e);
-		actionTracker.HandleZonePacket();
-		MarkPartyCacheDirty(); -- Invalidate party cache on zone
-		bLoggedIn = true;
-	elseif (e.id == 0x0029) then
-		local messagePacket = ParseMessagePacket(e.data);
-		if (messagePacket) then
-			debuffHandler.HandleMessagePacket(messagePacket);
-		end
-	elseif (e.id == 0x00B) then
-		bLoggedIn = false;
-	elseif (e.id == 0x076) then
-		statusHandler.ReadPartyBuffsFromPacket(e);
-	elseif (e.id == 0x0DD) then
-		-- Party member update packet - invalidate party cache
-		MarkPartyCacheDirty();
-	end
+        -- Route to notifications handler
+        if gConfig.showNotifications and gConfig.notificationsShowTreasure then
+            notifications.HandleTreasureLot(e);
+        end
+    end
 end);
+
+-- ============================================
+-- Outgoing Packet Handler
+-- ============================================
+
+ashita.events.register('packet_out', 'packet_out_cb', function (e)
+    if (e.id == 0x0074) then
+        -- Party invite response (accept/decline)
+        if gConfig.showNotifications then
+            notifications.HandlePartyInviteResponse(e);
+        end
+    end
+end);
+
+-- ============================================
+--Key Handler
+-- ============================================
+
+--[[ Valid Arguments
+
+    e.wparam     - (ReadOnly) The wparam of the event.
+    e.lparam     - (ReadOnly) The lparam of the event.
+    e.blocked    - (Writable) Flag that states if the key has been, or should be, blocked.
+
+    See the following article for how to process and use wparam/lparam values:
+    https://docs.microsoft.com/en-us/previous-versions/windows/desktop/legacy/ms644984(v=vs.85)
+
+    Note: Key codes used here are considered 'virtual key codes'.
+--]]
+
+--[[ Note
+
+        The game uses WNDPROC keyboard information to process keyboard input for chat and other
+        user-inputted text prompts. (Bazaar comment, search comment, etc.)
+
+        Blocking a press here will only block it during inputs of those types. It will not block
+        in-game button handling for things such as movement, menu interactions, etc.
+--]]
+ashita.events.register('key', 'key_cb', function (event)
+    hotbar.HandleKey(event);
+end);
+
+-- ============================================
+-- Controller Input Event Handlers
+-- ============================================
+
+-- XInput controller state event (for crossbar mode - analog triggers)
+-- Note: This fires every frame, so we don't log it (too spammy)
+ashita.events.register('xinput_state', 'xinput_state_cb', function (e)
+    hotbar.HandleXInputState(e);
+end);
+
+-- XInput button event (for blocking game macros when crossbar is active)
+--[[ Valid Arguments
+    e.button    - (Writable) The controller button id.
+    e.state     - (Writable) The controller button state value.
+    e.blocked   - (Writable) Flag that states if the button has been, or should be, blocked.
+    e.injected  - (ReadOnly) Flag that states if the button was injected by Ashita or an addon/plugin.
+--]]
+ashita.events.register('xinput_button', 'xinput_button_cb', function (e)
+    if DEBUG_RAW_INPUT then
+        print(string.format('[XIUI RawInput] xinput_button: button=%d state=%d', e.button or -1, e.state or -1));
+    end
+    local shouldBlock = hotbar.HandleXInputButton(e);
+    if shouldBlock then
+        e.blocked = true;
+    end
+end);
+
+-- DirectInput controller button event (for crossbar mode with DirectInput controllers)
+-- Used by: DualSense, Switch Pro, Stadia controllers
+ashita.events.register('dinput_button', 'dinput_button_cb', function (e)
+    if DEBUG_RAW_INPUT then
+        print(string.format('[XIUI RawInput] dinput_button: button=%d state=%d', e.button or -1, e.state or -1));
+    end
+    local shouldBlock = hotbar.HandleDInputButton(e);
+    if shouldBlock then
+        e.blocked = true;
+    end
+end);
+
+-- DirectInput controller state event (for D-pad POV on DirectInput controllers)
+-- Note: This fires every frame, so we don't log it (too spammy)
+ashita.events.register('dinput_state', 'dinput_state_cb', function (e)
+    hotbar.HandleDInputState(e);
+end);
+
+-- ============================================
+-- NOTE: Render order is fixed by Ashita core: Primitives > GDI Fonts > ImGui
+-- We cannot change this from addon level - ImGui always renders last.
